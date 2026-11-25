@@ -9027,7 +9027,18 @@ impl Host {
                 }
             };
         }
+        let state_u32 = state;
         let p = presenter.as_mut()?;
+        if planes.is_some() && p.composer.is_none() {
+            match crate::compose::Composer::new(self, format) {
+                Ok(c) => p.composer = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
+                    drop(presenter);
+                    return self.present_planes(texture, state_u32, None, frame);
+                }
+            }
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9057,7 +9068,17 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        if planes.is_some() && p.composer.is_none() {
+            match crate::compose::Composer::new(self, format) {
+                Ok(c) => p.composer = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
+                    drop(presenter);
+                    return self.present_planes(texture, state_u32, None, frame);
+                }
+            }
+        }
+        let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -9091,12 +9112,6 @@ impl Host {
             let list = &copy.list;
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
-                if p.composer.is_none() {
-                    match crate::compose::Composer::new(self, format) {
-                        Ok(c) => p.composer = Some(c),
-                        Err(e) => tracing::warn!(error = %e, "two-plane composer not made; showing base plane only"),
-                    }
-                }
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
@@ -9108,14 +9123,31 @@ impl Host {
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
                     list.ResourceBarrier(&pre);
                     let compose_slot = slot.map_or(0, |i| i + 1);
-                    let _ = composer.record(
+                    if let Err(err) = composer.record(
                         self,
                         compose_slot,
                         list,
                         [(texture, base_fmt), (over, over_fmt)],
                         &back,
                         (width, height),
-                    );
+                    ) {
+                        copy.close();
+                        drop(back);
+                        drop(presenter);
+                        tracing::warn!(%err, "could not record display composite; presenting the base plane");
+                        return self.present_planes(texture, state_u32, None, frame);
+                    }
+                    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !ONCE.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            frame,
+                            width,
+                            height,
+                            base_format = base_fmt.0,
+                            overlay_format = over_fmt.0,
+                            "display output: compositing two planes (overlay active)"
+                        );
+                    }
                     let mut post = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
@@ -9137,14 +9169,16 @@ impl Host {
                 false
             };
             if !composed {
-                list.ResourceBarrier(&[
-                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ]);
+                let mut pre = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                }
+                pre.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+                list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
@@ -9191,14 +9225,16 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
             } else {
-                list.ResourceBarrier(&[
-                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                    ),
-                ]);
+                let mut post = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    post.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                post.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                ));
+                list.ResourceBarrier(&post);
             }
             copy.close();
             let flown = match slot {
