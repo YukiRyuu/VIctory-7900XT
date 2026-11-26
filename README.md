@@ -65,13 +65,21 @@ scripts\play.ps1 -RX7900XT -Exe <path of your copy's executable>
 
 For playing, build `--release` instead (about a fifth faster per frame than
 the diagnostics build here: CHANGELOG.md), translate the shaders with
-`target
-eleaseictory.exe`, and add `-Build release` to the line above.
+`target\release\victory.exe`, and add `-Build release` to the line above.
 `-RX7900XT` adds the settings measured on this PC to the fork's own (they are
-listed in the script). If PowerShell refuses to run scripts, start it as
-`powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -RX7900XT -Exe ...`
-(for that one window only). After a first run, `target\diag\victory.exe warm --used`
-makes the pipelines it drew with ahead of the next one. In a diagnostics build,
+listed in the script).
+
+If PowerShell says running scripts is disabled on this system, allow scripts
+from your own disk for your user account (Microsoft's documented setting;
+downloaded scripts still need to be unblocked first), then unblock this one:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+Unblock-File scripts\play.ps1
+```
+
+After a first run, `target\diag\victory.exe warm --used` makes the pipelines it
+drew with ahead of the next one. In a diagnostics build,
 `-More @{VICTORY_CAPTURE='<a folder>'}` lets F11 save the next 8 frames there.
 
 ## What was found
@@ -132,7 +140,8 @@ kept, and commits taken from elsewhere keep their authors.
   budgets for 32 GB PCs, descriptor slots released on completion, and more,
   merged as they are (CHANGELOG.md).
 - **[Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett)**:
-  picture fixes, memory and upload switches, merged (CHANGELOG.md).
+  picture fixes, memory and upload switches, merged (CHANGELOG.md; their
+  working notes and scripts are not carried here).
 - Built on, tested or studied on the way here, for code, settings, ideas and
   measurements:
   **[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)**

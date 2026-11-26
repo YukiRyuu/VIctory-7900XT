@@ -5,6 +5,22 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## What the repository carries, checked (2026-11-26)
+
+Microsoft Defender (signatures of the day) finds nothing in the repository's
+archive, its files or either build. No executables, archives or encoded data;
+one script (`scripts\play.ps1`). The README no longer suggests starting
+PowerShell with the execution policy bypassed (a phrase scanners and chat
+filters flag); it shows Microsoft's per-user setting instead, and a line of it
+that an edit had broken is mended. The Scarlett fork's `tools/` folder (their
+working notes and patch files, among them notes on the game's own code) is not
+carried any more: nothing builds from it.
+
+What a scanner may still dislike in the program itself is what a compatibility
+layer does: it loads another program's executable into its own process,
+changes page protections, catches access faults and writes into its own memory
+through the kernel. None of it touches another process.
+
 ## The purple in shadows fixed (2026-11-26)
 
 Blinds, curtains, bushes and trees glowed purple, most at night. Bisected
