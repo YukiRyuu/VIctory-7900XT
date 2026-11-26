@@ -755,7 +755,10 @@ pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 
 /// The process's private bytes (diagnostics: around the making of lists).
 /// Resets of a host list after which its command allocator is replaced by a
-/// fresh one (`VICTORY_ALLOCATOR_RESETS`, 128; 0: never, as before). An
+/// fresh one (`VICTORY_ALLOCATOR_RESETS`, 0: never, the default).
+/// Measured on an RX 7900 XT: 12,288 replacements in five minutes of the world
+/// gave back 2 MB in all, so the driver does not return what a released
+/// allocator held (or that memory is not the allocators'); off by default. An
 /// allocator never gives back what it grew to: one that recorded a loading
 /// burst once kept that memory for the rest of the session, in the driver's
 /// write-combined system memory (about 20 GB of a 39 GB process on an
@@ -764,7 +767,7 @@ pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 fn allocator_resets() -> u32 {
     static EVERY: OnceLock<u32> = OnceLock::new();
     *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_ALLOCATOR_RESETS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128)
+        std::env::var("VICTORY_ALLOCATOR_RESETS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
     })
 }
 
