@@ -459,6 +459,29 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// (fxceless a35c557) As [`host_pipeline`], for a draw into render target and depth views
+/// of the formats `bound`: if a bound view has another format than the title's pipeline
+/// declares for its slot (`host::formats_differ`), the host pipeline of the same shaders
+/// and state made for the bound formats (`make::for_formats`). A draw whose views are as
+/// declared pays one comparison of nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
+/// Pipelines made again for the formats bound at their draw, since the start.
+#[cfg(windows)]
+pub(crate) fn variants_made() -> u64 {
+    make::VARIANTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -769,6 +792,8 @@ mod make;
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
+    // (Fox port C, `VICTORY_LIBRARY_SAVE_S`) Pipelines waiting to be written.
+    library::save_due();
 }
 
 /// The pipeline library's part of the report when the host device is

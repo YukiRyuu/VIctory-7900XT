@@ -240,7 +240,15 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
+            // (Fox port C) The submit thread at work, for the frame log
+            // ("submit thread: at work ... (user, kernel)").
+            let started = std::time::Instant::now();
+            let (user, kernel) = crate::framelog::thread_times();
             self.look(limit);
+            let (user_now, kernel_now) = crate::framelog::thread_times();
+            crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+            crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);

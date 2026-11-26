@@ -226,6 +226,8 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // (F10, `VICTORY_MAP_DEFER`) What the title asked for so far, as it asked.
+    DEFER.before(address as usize, 1);
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
@@ -392,6 +394,11 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// (`VICTORY_POOL_DISCARD`) A bit per page: written through
+    /// [`Section::window`] and not discarded since (resident in our view).
+    resident: Box<[std::sync::atomic::AtomicU64]>,
+    /// (`VICTORY_POOL_DISCARD`) A bit per page: discarded and not written since.
+    discarded: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 impl Section {
@@ -439,6 +446,7 @@ impl Section {
             }
             page += run;
         }
+        pool_discard::written(self, index, n);
         Some(base + index * PAGE)
     }
 }
@@ -683,6 +691,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        resident: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        discarded: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -927,7 +937,9 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
             // The bytes of this page that the write covers.
             let lo = if i == 0 { offset % PAGE } else { 0 };
             let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(shown.at(slice).into_iter().map(|(at, _)| (at + lo, hi - lo)));
+            // (F10, `VICTORY_MAP_DEFER`) Not where an unmapping is pending:
+            // once applied, nothing shows the bytes there.
+            pieces.extend(shown.at(slice).into_iter().filter(|(at, _)| !DEFER.pending_at(*at)).map(|(at, _)| (at + lo, hi - lo)));
         }
     }
     pieces.sort_unstable();
@@ -1088,6 +1100,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    // (F10, `VICTORY_MAP_DEFER`) Pending unmappings of these pages first, in
+    // call order (none on the thread applying them).
+    DEFER.before(base, n.saturating_mul(PAGE));
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
@@ -1099,6 +1114,27 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
+    // (Neptune, `VICTORY_REMAP_SAME`) The pages are there already, each where
+    // it is asked for, or nothing is there and nothing is asked for: no view
+    // is taken away or made, and the notes of a remapping are not made, as
+    // nothing they describe changed. The GPU side is told the bytes may have
+    // changed (`kernel_will_write`), as a remapping told it (`=2`: told
+    // nothing; `=0`: mapped again, as before).
+    let mode = remap_same();
+    if mode != 0 {
+        let same = match &pages {
+            Some(asked) => shows(&physical, base, asked),
+            None => shows_nothing(&physical, base, n * PAGE),
+        };
+        same_count(n, pages.is_some(), same);
+        if same {
+            drop(physical);
+            if mode == 1 && pages.is_some() {
+                victory_gpu::kernel_will_write(base, n * PAGE);
+            }
+            return address;
+        }
+    }
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
@@ -1143,6 +1179,103 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
+    if super::mapdefer::on() {
+        // (F10, `VICTORY_MAP_DEFER`) Unmappings deferred, maps as below.
+        return scatter_deferred(addresses, n, pages).into();
+    }
+    scatter_now(addresses, n, pages)
+}
+
+/// (F10, `VICTORY_MAP_DEFER`) The deferred unmappings of both views.
+pub(crate) static DEFER: LazyLock<super::mapdefer::Deferrer> =
+    LazyLock::new(|| super::mapdefer::Deferrer::new(apply_deferred, super::mapdefer::LIMIT_PAGES));
+
+/// (F10) Applies a deferred unmapping as the call would have: the CPU view
+/// page by page (`XMemMapPhysicalPages(at, 1, null)`), the GPU view as
+/// `map_alias(at, 0, len)` in pieces of at most 16 views cut at view starts
+/// (no view is cut that the whole range would not cut; the views' lock is
+/// let go between pieces, so the frame thread's maps are not held up long).
+fn apply_deferred(op: &super::mapdefer::Op) {
+    use super::mapdefer::Op;
+    match *op {
+        Op::Cpu { at, pages } => {
+            for k in 0..pages {
+                XMemMapPhysicalPages((at + k * PAGE) as *mut c_void, 1, std::ptr::null());
+            }
+        }
+        Op::Gpu { at, len } => {
+            let end = at.saturating_add(len);
+            let starts: Vec<usize> =
+                if len == 0 { Vec::new() } else { physical().views.range(at + 1..end).map(|(a, _)| *a).collect() };
+            let mut from = at;
+            for (i, b) in starts.into_iter().enumerate() {
+                if (i + 1) % 16 == 0 {
+                    map_alias(from as u64, 0, (b - from) as u64);
+                    from = b;
+                }
+            }
+            map_alias(from as u64, 0, (end - from) as u64);
+        }
+    }
+}
+
+/// (F10, `VICTORY_MAP_DEFER`) `XMemMapPhysicalPagesScatter` with its
+/// unmappings deferred (entries that follow on page by page as one
+/// operation, applied page by page) and its maps done now by the fox path
+/// ([`scatter_now`], side by side as `VICTORY_MAP_THREADS` says), after the
+/// pending unmappings of their pages. An unmapping is deferred only after
+/// the maps before it in the call are done (one may be of its page).
+fn scatter_deferred(addresses: *const *mut c_void, n: usize, pages: *const usize) -> bool {
+    use super::mapdefer::Op;
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let entry = |i: usize| unsafe {
+        let page = if pages.is_null() { 0 } else { *pages.add(i) };
+        (*addresses.add(i), page)
+    };
+    let mut run: Option<(usize, usize)> = None;
+    let mut maps: Vec<(*mut c_void, usize)> = Vec::new();
+    let mut ok = true;
+    let flush_maps = |maps: &mut Vec<(*mut c_void, usize)>| {
+        if maps.is_empty() {
+            return true;
+        }
+        for &(at, _) in maps.iter() {
+            DEFER.before(at as usize, PAGE);
+        }
+        let (a, p): (Vec<*mut c_void>, Vec<usize>) = maps.drain(..).unzip();
+        scatter_now(a.as_ptr(), a.len(), p.as_ptr()) != 0
+    };
+    for i in 0..n {
+        let (address, page) = entry(i);
+        let at = address as usize;
+        if page == 0 {
+            ok &= flush_maps(&mut maps);
+            match &mut run {
+                Some((first, k)) if first.checked_add(*k * PAGE) == Some(at) => *k += 1,
+                _ => {
+                    if let Some((at, pages)) = run.take() {
+                        DEFER.defer(Op::Cpu { at, pages });
+                    }
+                    run = Some((at, 1));
+                }
+            }
+        } else {
+            if let Some((at, pages)) = run.take() {
+                DEFER.defer(Op::Cpu { at, pages });
+            }
+            maps.push((address, page));
+        }
+    }
+    ok &= flush_maps(&mut maps);
+    if let Some((at, pages)) = run.take() {
+        DEFER.defer(Op::Cpu { at, pages });
+    }
+    super::mapdefer::line_now();
+    ok
+}
+
+/// The fox base's `XMemMapPhysicalPagesScatter` after its checks, as it was.
+fn scatter_now(addresses: *const *mut c_void, n: usize, pages: *const usize) -> BOOL {
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
         let wanted: Vec<(usize, usize)> = (0..n)
@@ -1178,6 +1311,16 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    // (F10, `VICTORY_MAP_DEFER`) An unmapping (always a success here)
+    // deferred; a map applies the pending unmappings of both its ranges first.
+    if from == 0 && super::mapdefer::on() {
+        DEFER.defer(super::mapdefer::Op::Gpu { at: to as usize, len: len as usize });
+        return true;
+    }
+    DEFER.before(to as usize, len as usize);
+    if from != 0 {
+        DEFER.before(from as usize, len as usize);
+    }
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
@@ -1202,6 +1345,43 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    if super::mapdefer::on() {
+        lift_thread();
+        // (F10, `VICTORY_MAP_DEFER`) Unmappings deferred in order; the maps
+        // between them go by the fox path after the pending unmappings of
+        // their ranges (an unmapping after a map of the same page is
+        // deferred only once the maps before it are done).
+        let mut ok = true;
+        let mut maps: Vec<(u64, u64, u64)> = Vec::new();
+        let flush = |maps: &mut Vec<(u64, u64, u64)>| {
+            if maps.is_empty() {
+                return true;
+            }
+            for &(to, from, len) in maps.iter() {
+                DEFER.before(to as usize, len as usize);
+                DEFER.before(from as usize, len as usize);
+            }
+            let done = map_aliases_now(maps);
+            maps.clear();
+            done
+        };
+        for &(to, from, len) in ranges {
+            if from == 0 {
+                ok &= flush(&mut maps);
+                DEFER.defer(super::mapdefer::Op::Gpu { at: to as usize, len: len as usize });
+            } else {
+                maps.push((to, from, len));
+            }
+        }
+        ok &= flush(&mut maps);
+        super::mapdefer::line_now();
+        return ok;
+    }
+    map_aliases_now(ranges)
+}
+
+/// The fox base's [`map_aliases`], as it was.
+fn map_aliases_now(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
     if side_by_side() <= 1 {
@@ -1255,6 +1435,9 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.waited = costed.started.elapsed().as_nanos() as u64;
         }
+        // (`VICTORY_REMAP_SAME`) Pages there already, told after the change.
+        let mut same_at: Vec<usize> = Vec::new();
+        let mode = remap_same();
         {
             let table = page_table();
             let mut touched = std::collections::HashSet::new();
@@ -1267,17 +1450,101 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
                     tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
                     ok = false;
                 }
-                ops.push(Op::new(to, slice));
                 at += 1;
+                if mode != 0 {
+                    let there = physical.slice_at(to);
+                    let same = match (&slice, &there) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(&a.section, &b.section) && a.index == b.index,
+                        (None, None) => page == 0 && shows_nothing(&physical, to, PAGE),
+                        _ => false,
+                    };
+                    same_count(1, page != 0, same);
+                    if same {
+                        if page != 0 {
+                            same_at.push(to);
+                        }
+                        continue;
+                    }
+                }
+                ops.push(Op::new(to, slice));
             }
         }
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let _changing = victory_gpu::title_memory_remapping();
-        ok &= change(&mut physical, ops);
+        if !ops.is_empty() {
+            let _changing = victory_gpu::title_memory_remapping();
+            ok &= change(&mut physical, ops);
+        }
+        drop(physical);
+        if mode == 1 {
+            for to in same_at {
+                victory_gpu::kernel_will_write(to, PAGE);
+            }
+        }
     }
     ok
+}
+
+/// (Neptune) What a mapping of pages that are shown there already does
+/// (`VICTORY_REMAP_SAME`; fox port: default 0 = mapped again as the fox base
+/// does, until an A/B run; our tree's default was 1): 1: no view is taken away or made,
+/// and the GPU side is told the bytes may have changed; 2: nothing; 0: the
+/// pages are mapped again. The title's CPU view only (`XMemMapPhysicalPages`
+/// and its scatter form); the GPU view's copies of mappings go as before.
+fn remap_same() -> u8 {
+    static MODE: LazyLock<u8> =
+        LazyLock::new(|| std::env::var("VICTORY_REMAP_SAME").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    *MODE
+}
+
+/// Whether `[base, base + pages)` shows `pages` already, page for page (none
+/// unknown).
+fn shows(physical: &Physical, base: usize, pages: &[usize]) -> bool {
+    let table = page_table();
+    pages.iter().enumerate().all(|(i, page)| {
+        let (Some(want), Some(there)) = (table.pages.get(page), physical.slice_at(base + i * PAGE)) else {
+            return false;
+        };
+        Arc::ptr_eq(&want.section, &there.section) && want.index == there.index
+    })
+}
+
+/// Whether no view shows any of `[base, base + len)`.
+fn shows_nothing(physical: &Physical, base: usize, len: usize) -> bool {
+    let before = physical.views.range(..=base).next_back().is_some_and(|(at, (size, _))| at + size > base);
+    !before && physical.views.range(base..base.saturating_add(len)).next().is_none()
+}
+
+/// (Neptune) Since the last line: pages asked to be mapped or unmapped, of
+/// them there already, of nothing unmapped (nothing done).
+static SAME: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Counts `n` pages asked (`mapped`: pages, not an unmapping; `same`: there
+/// already), with a line every five seconds.
+fn same_count(n: usize, mapped: bool, same: bool) {
+    SAME[0].fetch_add(n as u64, Ordering::Relaxed);
+    if same {
+        SAME[if mapped { 1 } else { 2 }].fetch_add(n as u64, Ordering::Relaxed);
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.try_lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let secs = now.duration_since(*last.get_or_insert(now)).as_secs_f64();
+    if secs < 5.0 {
+        return;
+    }
+    *last = Some(now);
+    let w = [0, 1, 2].map(|i| SAME[i].swap(0, Ordering::Relaxed) as f64 / secs);
+    tracing::info!(
+        "title memory mappings asked for, a second over {secs:.0} s: {:.0} pages mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done) (VICTORY_REMAP_SAME={})",
+        w[0],
+        w[1],
+        w[2],
+        remap_same()
+    );
 }
 
 /// Pages changed under the locks at once.
@@ -1386,11 +1653,13 @@ struct Op {
     had: bool,
     /// The placeholder is the page's own (or will be, after the unmapping).
     own: bool,
+    /// (`VICTORY_POOL_DISCARD`) What the view taken away showed.
+    old: Option<Slice>,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false }
+        Op { at, slice, had: false, own: false, old: None }
     }
 
     /// The system calls; whether the host did as asked.
@@ -1431,6 +1700,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             Some((base, PAGE)) if base == op.at => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
+                    op.old = Some(slice);
                 }
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
@@ -1458,6 +1728,22 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     let mut ok = true;
     for (op, done) in done {
         match op.slice {
+            _ if op.had && done => {
+                // (`VICTORY_UNMAP_EXACT`, `VICTORY_WINDOW_UNMAP`) The page's old
+                // view is really gone (a new one may show other bytes there).
+                victory_gpu::hlehooks::title_memory_unmapped(op.at, PAGE);
+                if let Some(old) = &op.old {
+                    pool_discard::unshown(physical, old);
+                }
+                if let Some(slice) = op.slice {
+                    shown_mut().note(op.at, PAGE, &slice);
+                    victory_gpu::title_memory_remapped(op.at, PAGE);
+                    victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                    physical.views.insert(op.at, (PAGE, slice));
+                } else {
+                    physical.holes.insert(op.at, PAGE);
+                }
+            }
             Some(slice) if done => {
                 // As in `map`.
                 shown_mut().note(op.at, PAGE, &slice);
@@ -1587,7 +1873,7 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own, old: op.old.clone() };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
@@ -1749,6 +2035,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    // (`VICTORY_POOL_DISCARD`) The pages that lost a view, looked at once
+    // the views are as they stay.
+    let mut lost: Vec<Slice> = Vec::new();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1777,7 +2066,297 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(physical, end, at + size - end, Slice { index, section: slice.section.clone() });
+        }
+        // (`VICTORY_UNMAP_EXACT`, `VICTORY_WINDOW_UNMAP`) What of the view
+        // lay inside the range is really gone (the rest was mapped again).
+        if gone != 0 {
+            let (lo, hi) = (at.max(base), (at + size).min(end));
+            if lo < hi {
+                victory_gpu::hlehooks::title_memory_unmapped(lo, hi - lo);
+                if pool_discard::on() {
+                    lost.extend((lo..hi).step_by(PAGE).map(|a| Slice { index: slice.index + (a - at) / PAGE, section: slice.section.clone() }));
+                }
+            }
+        }
+    }
+    for page in &lost {
+        pool_discard::unshown(physical, page);
+    }
+}
+
+/// (Storage wait job, ported) `VICTORY_POOL_DISCARD` (fox port: default 0,
+/// the fox base's behaviour, until an A/B run; 1 on, our tree's default;
+/// needs the section's lasting view, `VICTORY_SECTION_WINDOW`, the fox
+/// base's form of our `VICTORY_DSTORAGE_LINEAR_VIEW`). The lasting view
+/// keeps every page DirectStorage ever wrote through it in this process's
+/// working set, also after the title has given the page back (run-49: 24.7
+/// GB working set against 19.1). The title's streaming pool is one
+/// allocation it shows whole at one address for good (its pool view) and
+/// maps page by page into its CPU and GPU streaming views from a free list;
+/// a page shown by no view but a whole-section one is on that free list and
+/// its bytes are dead. Such a page, still so [`pool_discard::delay`] after it was
+/// last unmapped and while free RAM is under `VICTORY_POOL_DISCARD_BELOW_MB`
+/// (4096; 0: always), is reset in the lasting view (`MEM_RESET`) and taken
+/// out of the working set (`VirtualUnlock`), under the views' lock, so no
+/// map of it can come between the check and the reset. Pages of sections
+/// without a whole view are never touched. `VICTORY_POOL_DISCARD_DELAY_S`:
+/// 0 (default) adaptive 2-10 s, N fixed. Line every 30 s: "pool discard: ...".
+mod pool_discard {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::{PAGE, Physical, Section, Slice};
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let window = std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0");
+            let on = window && std::env::var_os("VICTORY_POOL_DISCARD").is_some_and(|v| v == "1");
+            tracing::info!(on, "VICTORY_POOL_DISCARD: pool pages the title has given back (shown by no view but its whole pool view) are reset and taken out of the working set in the section's lasting view while free RAM is short");
+            on
+        })
+    }
+
+    /// Pages resident through the lasting views, discarded since the
+    /// start, resets refused, rewritten within 5 s of their discard.
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    const RESIDENT: usize = 0;
+    const DISCARDED: usize = 1;
+    const FAILED: usize = 2;
+    const REWRITTEN: usize = 3;
+
+    /// Pages that lost a view, to look at again later: when, and the page.
+    static UNSHOWN: Mutex<VecDeque<(Instant, Slice)>> = Mutex::new(VecDeque::new());
+    /// The most pages kept noted.
+    const UNSHOWN_MOST: usize = 1 << 18;
+    /// When each page was discarded, until written again (or 5 s on).
+    static DISCARDED_AT: LazyLock<Mutex<HashMap<(usize, usize), Instant>>> = LazyLock::new(Default::default);
+    /// Discards in the adaptive window, and of them rewritten within 5 s.
+    static WINDOW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static HELD_BY_RAM: AtomicBool = AtomicBool::new(false);
+    static DELAY_MS: AtomicU64 = AtomicU64::new(2000);
+
+    fn key(section: &Section, index: usize) -> (usize, usize) {
+        (std::ptr::from_ref(section) as usize, index)
+    }
+
+    /// Pages `[index, index + n)` of `section` were written through its
+    /// lasting view: resident there from now on.
+    pub(super) fn written(section: &Section, index: usize, n: usize) {
+        if !on() {
+            return;
+        }
+        for k in index..(index + n).min(section.pages) {
+            let bit = 1u64 << (k % 64);
+            if section.resident[k / 64].fetch_or(bit, Relaxed) & bit == 0 {
+                COUNTS[RESIDENT].fetch_add(1, Relaxed);
+            }
+            if section.discarded[k / 64].fetch_and(!bit, Relaxed) & bit != 0 {
+                let at = DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).remove(&key(section, k));
+                if at.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+                    COUNTS[REWRITTEN].fetch_add(1, Relaxed);
+                    WINDOW[1].fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Whether only whole-section views show `page` now, and at least one.
+    fn only_whole_views(physical: &Physical, page: &Slice) -> bool {
+        let addresses = super::SHOWN.read().unwrap_or_else(|e| e.into_inner()).at(page);
+        let size = page.section.pages * PAGE;
+        !addresses.is_empty()
+            && addresses.iter().all(|&(a, _)| {
+                physical
+                    .views
+                    .range(..=a)
+                    .next_back()
+                    .is_some_and(|(&at, (len, slice))| at + len > a && *len == size && slice.index == 0)
+            })
+    }
+
+    /// A page lost a view (with the views' lock held): noted if it is
+    /// resident in our lasting view and only the pool view shows it now.
+    pub(super) fn unshown(physical: &Physical, page: &Slice) {
+        if !on() {
+            return;
+        }
+        let bit = 1u64 << (page.index % 64);
+        if page.index >= page.section.pages
+            || page.section.resident[page.index / 64].load(Relaxed) & bit == 0
+            || !only_whole_views(physical, page)
+        {
+            return;
+        }
+        UNSHOWN.lock().unwrap_or_else(|e| e.into_inner()).push_back((Instant::now(), page.clone()));
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let _ = std::thread::Builder::new().name("victory-pool-discard".into()).spawn(discard_loop);
+        });
+    }
+
+    fn below() -> u64 {
+        static MB: OnceLock<u64> = OnceLock::new();
+        let mb = *MB.get_or_init(|| {
+            let mb = std::env::var("VICTORY_POOL_DISCARD_BELOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096);
+            tracing::info!(mb, "VICTORY_POOL_DISCARD_BELOW_MB: pool pages are discarded only while free RAM is under this (0: always)");
+            mb
+        });
+        if mb == 0 { u64::MAX } else { mb << 20 }
+    }
+
+    fn free_ram() -> Option<u64> {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys)
+    }
+
+    fn delay_setting() -> u64 {
+        static S: OnceLock<u64> = OnceLock::new();
+        *S.get_or_init(|| {
+            let s = std::env::var("VICTORY_POOL_DISCARD_DELAY_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            tracing::info!(s, "VICTORY_POOL_DISCARD_DELAY_S: wait after a pool page's last unmapping before it is discarded (0: adaptive 2-10 s by pages rewritten within 5 s)");
+            s
+        })
+    }
+
+    /// The next adaptive delay from the last window's discards `d` and of
+    /// them rewritten within 5 s `r`, and free RAM: more than a quarter
+    /// rewritten doubles it (up to 10 s), under 5 % halves it (down to 2 s);
+    /// under 1 GiB free RAM it is 2 s.
+    pub(super) fn next_delay(ms: u64, d: u64, r: u64, free: Option<u64>) -> u64 {
+        if free.is_some_and(|f| f < 1 << 30) {
+            return 2000;
+        }
+        if d >= 64 && r * 4 > d {
+            (ms * 2).min(10_000)
+        } else if d >= 64 && r * 20 < d {
+            (ms / 2).max(2000)
+        } else {
+            ms
+        }
+    }
+
+    fn delay() -> Duration {
+        match delay_setting() {
+            0 => Duration::from_millis(DELAY_MS.load(Relaxed)),
+            s => Duration::from_secs(s),
+        }
+    }
+
+    fn discard_loop() {
+        use windows_sys::Win32::System::Memory::{MEM_RESET, PAGE_READWRITE, VirtualAlloc, VirtualUnlock};
+        let mut window = Instant::now();
+        let mut said = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if window.elapsed() >= Duration::from_secs(5) {
+                window = Instant::now();
+                let (d, r) = (WINDOW[0].swap(0, Relaxed), WINDOW[1].swap(0, Relaxed));
+                DELAY_MS.store(next_delay(DELAY_MS.load(Relaxed), d, r, free_ram()), Relaxed);
+                DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, at| at.elapsed() < Duration::from_secs(5));
+            }
+            if said.elapsed() >= Duration::from_secs(30) {
+                said = Instant::now();
+                tracing::info!("{}", line());
+            }
+            let quiet = delay();
+            if free_ram().is_some_and(|free| free >= below()) {
+                HELD_BY_RAM.store(true, Relaxed);
+                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                let over = queue.len().saturating_sub(UNSHOWN_MOST);
+                queue.drain(..over);
+                continue;
+            }
+            HELD_BY_RAM.store(false, Relaxed);
+            let due: Vec<Slice> = {
+                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                let n = queue.iter().take_while(|(at, _)| at.elapsed() >= quiet).count();
+                queue.drain(..n).map(|(_, s)| s).collect()
+            };
+            // Pieces of 1,024 pages, the lock let go between them.
+            for piece in due.chunks(1024) {
+                let physical = super::physical();
+                // (lasting view base, first index, pages)
+                let mut runs: Vec<(usize, usize, usize, Arc<Section>)> = Vec::new();
+                for page in piece {
+                    let section = &*page.section;
+                    let Some(&base) = section.window.get() else { continue };
+                    let bit = 1u64 << (page.index % 64);
+                    if base == 0 || section.resident[page.index / 64].load(Relaxed) & bit == 0 || !only_whole_views(&physical, page) {
+                        continue;
+                    }
+                    section.resident[page.index / 64].fetch_and(!bit, Relaxed);
+                    section.discarded[page.index / 64].fetch_or(bit, Relaxed);
+                    DISCARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).insert(key(section, page.index), Instant::now());
+                    WINDOW[0].fetch_add(1, Relaxed);
+                    match runs.last_mut() {
+                        Some((b, first, n, _)) if *b == base && *first + *n == page.index => *n += 1,
+                        _ => runs.push((base, page.index, 1, page.section.clone())),
+                    }
+                }
+                for (base, first, n, _section) in runs {
+                    let (at, len) = ((base + first * PAGE) as *mut core::ffi::c_void, n * PAGE);
+                    // SAFETY: committed pages of our lasting view whose bytes
+                    // are dead (above); the lock keeps maps of them out, and
+                    // `_section` keeps the view.
+                    let reset = unsafe { VirtualAlloc(at, len, MEM_RESET, PAGE_READWRITE) };
+                    if reset.is_null() && COUNTS[FAILED].fetch_add(1, Relaxed) == 0 {
+                        tracing::warn!(error = %std::io::Error::last_os_error(), "VICTORY_POOL_DISCARD: MEM_RESET refused (taken out of the working set only)");
+                    }
+                    // SAFETY: as above; on pages not locked this only takes
+                    // them out of the working set.
+                    unsafe { VirtualUnlock(at, len) };
+                    COUNTS[RESIDENT].fetch_sub(n as u64, Relaxed);
+                    COUNTS[DISCARDED].fetch_add(n as u64, Relaxed);
+                }
+                drop(physical);
+            }
+        }
+    }
+
+    /// "pool discard: ..." with the process's working set.
+    fn line() -> String {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        let mb = |pages: u64| (pages * PAGE as u64) >> 20;
+        let failed = COUNTS[FAILED].load(Relaxed);
+        format!(
+            "pool discard: pool pages resident {} MB, discarded this run {} MB, rewritten within 5 s of a discard {} MB (delay {} ms), working set {} MB (peak {} MB) (VICTORY_POOL_DISCARD=1{}; only under {} MB free RAM, VICTORY_POOL_DISCARD_BELOW_MB{})",
+            mb(COUNTS[RESIDENT].load(Relaxed)),
+            mb(COUNTS[DISCARDED].load(Relaxed)),
+            mb(COUNTS[REWRITTEN].load(Relaxed)),
+            delay().as_millis(),
+            c.WorkingSetSize >> 20,
+            c.PeakWorkingSetSize >> 20,
+            if failed == 0 { String::new() } else { format!(", resets refused {failed}") },
+            if below() == u64::MAX { "any".to_owned() } else { (below() >> 20).to_string() },
+            if HELD_BY_RAM.load(Relaxed) { "; held now: RAM plentiful" } else { "" },
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::next_delay;
+
+        #[test]
+        fn the_discard_delay_adapts_to_pages_rewritten_soon() {
+            let plenty = Some(8u64 << 30);
+            assert_eq!(next_delay(2000, 100, 30, plenty), 4000);
+            assert_eq!(next_delay(8000, 100, 30, plenty), 10_000);
+            assert_eq!(next_delay(4000, 100, 2, plenty), 2000);
+            assert_eq!(next_delay(4000, 100, 10, plenty), 4000);
+            assert_eq!(next_delay(4000, 10, 10, plenty), 4000, "too few discards to judge");
+            assert_eq!(next_delay(8000, 100, 30, Some(512 << 20)), 2000, "short of RAM");
         }
     }
 }

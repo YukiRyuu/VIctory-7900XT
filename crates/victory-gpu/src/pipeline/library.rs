@@ -569,14 +569,56 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// When [`save`] last wrote (or looked at writing) the library.
+static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// A save running on [`save_due`]'s thread.
+static SAVING_NOW: AtomicBool = AtomicBool::new(false);
+
+/// (Fox port C, from victory-dev; `VICTORY_LIBRARY_SAVE_S`, default 0 =
+/// cool_fox's behaviour; ours ran 10; A/B candidate) Called once a second by the host's sweep: a library with
+/// pipelines not yet written is saved on a thread of its own once that many
+/// seconds passed since the last save. Without it a save came only from a
+/// pipeline worker after a make, at most every 20 s, and at a clean exit:
+/// pipelines made in the last 20 s before the watchdog ends a run were never
+/// written (run-49: 18 made at 355 s, last save 341 s, run ended at 360 s;
+/// the next run made them again, 3.7 s of waits in one frame).
+pub(crate) fn save_due() {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let secs = *S.get_or_init(|| {
+        let s = std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
+        tracing::info!(
+            "host pipeline library: written {} (VICTORY_LIBRARY_SAVE_S={s})",
+            if s == 0 { "by the workers at most every 20 s and at exit, as before" } else { "when pipelines wait to be written and the last save is that many seconds old" }
+        );
+        s
+    });
+    let pending = library().map_or(0, |l| l.added.load(Ordering::Relaxed));
+    if secs == 0 || pending == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    if LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(secs)) {
+        return;
+    }
+    if SAVING_NOW.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let work = || {
+        save(true);
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    };
+    if std::thread::Builder::new().name("victory-library-save".into()).spawn(work).is_err() {
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }

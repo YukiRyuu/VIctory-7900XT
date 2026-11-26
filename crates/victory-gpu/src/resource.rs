@@ -1179,6 +1179,10 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
+    /// (C3, upload causes) Made after an earlier host copy of the same title
+    /// texture was let go (room rule or idle); uploads recorded into it.
+    pub(crate) remade: std::sync::atomic::AtomicBool,
+    pub(crate) uploads: std::sync::atomic::AtomicU32,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -1623,6 +1627,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[1].fetch_add(host.bytes, Relaxed);
         }
         if r.host.gone.load(Relaxed) {
+            host.remade.store(true, Relaxed);
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
@@ -2031,35 +2036,58 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(made);
         }
     }
+    // (Fox port C, `VICTORY_UNMAP_EXACT`) Copies under memory the title
+    // really unmapped go first, whatever the room rule says.
+    let_go_unmapped();
     let memory = crate::host::host().and_then(|h| h.video_memory());
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
+            let raw = used;
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            let (idle_ms, most) = crate::host::vram_keep(budget, used);
+            if most == u64::MAX { raw_guard(budget, raw).unwrap_or((idle_ms, most)) } else { (idle_ms, most) }
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    let by_room = most != u64::MAX;
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // (`VICTORY_HEAP_PACK=1`) The blocks' occupancy, for the order.
+    let occupancy = (most != u64::MAX && crate::pool::heap_pack().1).then(crate::pool::Occupancy::now);
     if most != u64::MAX {
+        let mut ranked: Vec<(u64, u64, usize)> = Vec::new();
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                match &occupancy {
+                    // Sparsest block first, the longest idle within a step.
+                    Some(o) => {
+                        let raw = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(h, _)| {
+                            windows::core::Interface::as_raw(&h.texture) as usize
+                        });
+                        ranked.push((o.rank(raw), used & 0xffff_ffff, at));
+                    }
+                    None => by_age.push((used & 0xffff_ffff, at)),
+                }
             }
         }
-        by_age.sort_unstable();
+        if occupancy.is_some() {
+            ranked.sort_unstable();
+            by_age = ranked.into_iter().map(|(_, used, at)| (used, at)).collect();
+        } else {
+            by_age.sort_unstable();
+        }
     }
     // Without one, while textures are kept for minutes, a part of them at
     // each look, the next one at the next: a play has over 100,000
@@ -2112,9 +2140,19 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            if let Some(o) = &occupancy
+                && o.used_of(windows::core::Interface::as_raw(&host.texture) as usize).is_some_and(|u| u * 2 < 64 << 20)
+            {
+                crate::pool::PACKED[0].fetch_add(1, Relaxed);
+                crate::pool::PACKED[1].fetch_add(host.bytes, Relaxed);
+            }
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
+            if by_room {
+                ROOM_LET_GO[0].fetch_add(1, Relaxed);
+                ROOM_LET_GO[1].fetch_add(host.bytes, Relaxed);
+            }
             went += 1;
             bytes += host.bytes;
             if first.is_none() {
@@ -2122,6 +2160,9 @@ pub(crate) fn let_go_idle() {
             }
             crate::host::retire(host);
         }
+    }
+    if by_room {
+        ROOM_LET_GO[2].fetch_add(1, Relaxed);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -2135,6 +2176,391 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Since the start: copies the room rule let go (`vram_keep` past 88 % of
+/// the card, or [`raw_guard`]) and their bytes; sweeps it ran in.
+#[cfg(windows)]
+pub(crate) static ROOM_LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// (Fox port C, vram-plan #1's raw stop; `VICTORY_VRAM_RAW_PCT`, unset = off =
+/// cool_fox) The room rule goes by the net use (the system's count less the
+/// free space of our texture blocks); the system goes by the raw count, and
+/// past the budget it moves card memory into the PC's (run-103: raw 16.3 GB
+/// of a 14.9 GB budget at 13.0 GB net, 6.2 GB of the PC's memory shared with
+/// the card). With this set (80-99), while the net use is under fox's 88 %
+/// mark and the raw use is past this share of the budget, the room rule takes
+/// copies idle for 5 s, at most 128 MB a second, down to 3 points under it.
+/// Meant with `VICTORY_HEAP_PACK=1` (sparsest block first: what goes empties
+/// blocks, which then go; without it LRU copies leave holes and raw use
+/// barely falls).
+#[cfg(windows)]
+fn raw_guard(budget: u64, raw: u64) -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    static PCT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let pct = (*PCT.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_RAW_PCT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|p| p.clamp(80, 99))
+    }))?;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if budget == 0 || raw <= budget / 100 * pct {
+        return None;
+    }
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now < last + 1_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return None;
+    }
+    RAW_GUARD.fetch_add(1, Relaxed);
+    Some((5_000, (raw - budget / 100 * (pct - 3)).min(128 << 20)))
+}
+
+/// Seconds [`raw_guard`] ran in.
+#[cfg(windows)]
+static RAW_GUARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (Fox port C, from victory-dev; `VICTORY_UNMAP_EXACT=1`; default 0 =
+/// cool_fox's behaviour, copies go by the room rule alone; A/B candidate) Whether a host
+/// copy of a placed texture the title fills goes at the next sweep once the
+/// title really unmapped its memory: the runtime tells of each unmapping
+/// (`crate::title_memory_unmapping`, [`note_unmapped_exact`]) and the sweep
+/// lets a copy go when no page of it is mapped now ([`mapped_now`]) and
+/// nothing holds it (no list, no slot; a held one is looked at again at the
+/// next sweep). This is the game's own release signal: cool_fox kept every
+/// copy for ten minutes under 88 % of the card (`vram_keep`, tuned on 24 GB),
+/// so streamed-out textures held the card until the room rule ran; ours let
+/// go 33,846 (8.8 GB) this way in run-98.
+#[cfg(windows)]
+pub(crate) fn unmap_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_UNMAP_EXACT").is_some_and(|v| v == "1")
+    })
+}
+
+/// Whether title memory `[at, at + len)` shows anything now: a page of a
+/// view of physical pages (the runtime's record, `crate::inplace`), or
+/// memory that is not such a view and is committed (its first or last
+/// page). `None` while the runtime changes a mapping: looked at again.
+#[cfg(windows)]
+pub(crate) fn mapped_now(at: u64, len: u64) -> Option<bool> {
+    if len == 0 {
+        return Some(false);
+    }
+    let _still = crate::watch::title_memory_reading_now()?;
+    if crate::inplace::shown_bytes(at as usize, len as usize).is_some_and(|b| b > 0) {
+        return Some(true);
+    }
+    let last = at.saturating_add(len - 1) & !0xfff;
+    Some(crate::texture::committed(at as usize as *const u8, 1) || crate::texture::committed(last as usize as *const u8, 1))
+}
+
+/// The ranges of title memory the title unmapped since the last sweep:
+/// sorted, merged, at most [`EXACT_RANGES`] (past that the nearest are
+/// joined: a joined range may cover memory nobody unmapped, which costs a
+/// look and frees nothing still mapped).
+#[cfg(windows)]
+static UNMAPPED_EXACT: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// How many ranges [`UNMAPPED_EXACT`] keeps.
+const EXACT_RANGES: usize = 1024;
+
+/// Puts `[base, base + len)` into the sorted, merged `ranges`; past `most`
+/// ranges, joins neighbours across the smallest gaps until three quarters
+/// of `most` are left. Every byte put stays covered.
+pub(crate) fn keep_exact(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64, most: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let (mut start, mut end) = (base, base.saturating_add(len));
+    let mut put = false;
+    for &(b_start, b_len) in ranges.iter() {
+        let b_end = b_start.saturating_add(b_len);
+        if b_end < start {
+            out.push((b_start, b_len));
+        } else if b_start > end {
+            if !put {
+                out.push((start, end - start));
+                put = true;
+            }
+            out.push((b_start, b_len));
+        } else {
+            start = start.min(b_start);
+            end = end.max(b_end);
+        }
+    }
+    if !put {
+        out.push((start, end - start));
+    }
+    if out.len() > most {
+        let keep = (most / 4 * 3).max(1);
+        let mut gaps: Vec<(u64, usize)> =
+            out.windows(2).enumerate().map(|(i, w)| (w[1].0 - (w[0].0 + w[0].1), i)).collect();
+        gaps.sort_unstable();
+        let mut join = vec![false; out.len()];
+        for &(_, i) in gaps.iter().take(out.len() - keep) {
+            join[i] = true;
+        }
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(keep);
+        let mut i = 0;
+        while i < out.len() {
+            let s = out[i].0;
+            let mut e = out[i].0 + out[i].1;
+            while join[i] {
+                i += 1;
+                e = out[i].0 + out[i].1;
+            }
+            joined.push((s, e - s));
+            i += 1;
+        }
+        out = joined;
+    }
+    *ranges = out;
+}
+
+/// Whether `[start, start + len)` shares a byte with one of the sorted,
+/// merged `ranges`.
+fn under_ranges(ranges: &[(u64, u64)], start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    // The first range that ends past `start`.
+    let i = ranges.partition_point(|&(s, l)| s.saturating_add(l) <= start);
+    ranges.get(i).is_some_and(|&(s, _)| s < end)
+}
+
+/// The runtime unmaps title memory `[base, base + len)`: noted for the
+/// next sweep ([`unmap_exact`]). Records only (one lock, a merge).
+#[cfg(windows)]
+pub(crate) fn note_unmapped_exact(base: u64, len: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 || !unmap_exact() {
+        return;
+    }
+    EXACT[4].fetch_add(1, Relaxed);
+    EXACT[5].fetch_add(len, Relaxed);
+    let mut u = UNMAPPED_EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    keep_exact(&mut u, base, len, EXACT_RANGES);
+}
+
+/// Since the start: copies let go on a real unmap and their bytes; copies
+/// under unmapped memory still held at a sweep (looked at again); copies
+/// under memory unmapped and mapped again (kept); unmappings told and
+/// their bytes.
+#[cfg(windows)]
+pub(crate) static EXACT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// [`unmap_exact`]: the copies under memory unmapped since the last sweep
+/// that no page of is mapped now and nothing holds go; held ones are
+/// looked at again at the next sweep.
+#[cfg(windows)]
+fn let_go_unmapped() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !unmap_exact() {
+        return;
+    }
+    let really = std::mem::take(&mut *UNMAPPED_EXACT.lock().unwrap_or_else(|e| e.into_inner()));
+    if really.is_empty() {
+        return;
+    }
+    let mut again: Vec<(u64, u64)> = Vec::new();
+    let (mut went, mut bytes, mut held, mut kept) = (0u64, 0u64, 0u64, 0u64);
+    {
+        let all = textures();
+        let (lo, hi) = (really[0].0, really.last().map_or(0, |&(s, l)| s.saturating_add(l)));
+        for &at in all.iter() {
+            // SAFETY: a texture leaves the table before it is freed, under
+            // the lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+                continue;
+            }
+            let start = r.data() as u64;
+            if start >= hi {
+                continue;
+            }
+            let size = footprint(&r.desc).map_or(0, |f| f.size);
+            if start.saturating_add(size) <= lo || !under_ranges(&really, start, size) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                continue;
+            }
+            let unmapped_now = match mapped_now(start, size) {
+                Some(mapped) => !mapped,
+                None => {
+                    again.push((start, size));
+                    continue;
+                }
+            };
+            if !unmapped_now {
+                kept += 1;
+                continue;
+            }
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let free = made.as_ref().is_some_and(|(host, _)| {
+                    std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1
+                });
+                if free {
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    made.take()
+                } else {
+                    if made.is_some() {
+                        held += 1;
+                        again.push((start, size));
+                    }
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                went += 1;
+                bytes += host.bytes;
+                crate::host::retire(host);
+            }
+        }
+    }
+    if !again.is_empty() {
+        let mut u = UNMAPPED_EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        for (start, size) in again {
+            keep_exact(&mut u, start, size, EXACT_RANGES);
+        }
+    }
+    EXACT[0].fetch_add(went, Relaxed);
+    EXACT[1].fetch_add(bytes, Relaxed);
+    EXACT[2].fetch_add(held, Relaxed);
+    EXACT[3].fetch_add(kept, Relaxed);
+    if went > 0 {
+        crate::host::trail(|| format!("sweep: {went} host copies of textures let go on a real unmap ({} KiB)", bytes >> 10));
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::{keep_exact, under_ranges};
+
+    #[test]
+    fn unmapped_ranges_merge_and_are_found() {
+        let mut r = Vec::new();
+        keep_exact(&mut r, 0x1000, 0x1000, 8);
+        keep_exact(&mut r, 0x5000, 0x1000, 8);
+        keep_exact(&mut r, 0x2000, 0x1000, 8);
+        assert_eq!(r, vec![(0x1000, 0x2000), (0x5000, 0x1000)]);
+        assert!(under_ranges(&r, 0x2fff, 2));
+        assert!(!under_ranges(&r, 0x3000, 0x2000));
+        assert!(under_ranges(&r, 0x4000, 0x1001));
+        assert!(!under_ranges(&r, 0x6000, 0x1000));
+        // Past the limit neighbours are joined; nothing put is dropped.
+        for i in 0..20u64 {
+            keep_exact(&mut r, 0x10_0000 + i * 0x10000, 0x1000, 8);
+        }
+        assert!(r.len() <= 8);
+        for i in 0..20u64 {
+            assert!(under_ranges(&r, 0x10_0000 + i * 0x10000, 0x1000));
+        }
+    }
+}
+
+/// (Fox port C, from victory-dev) Once every five seconds, from the sweep:
+/// one line of what the layer holds and gave back, in our tree's wording
+/// (scripts read "card N MB in use (N MB counting free heap space) of N MB",
+/// "texture copies alive N MB", "made again N MB (N MB in the last 5 s)",
+/// "out-of-memory fallback ran N times", "free RAM N MB").
+/// `VICTORY_HOUSEKEEPING_LOG=0`: none. In this base: "in use" is the net
+/// use the room rule goes by (`vram_keep`: the system's count less the free
+/// space of our texture blocks, plus room kept for buffer copies and
+/// targets), high / low are its 88 % / 85 % marks, "let go for room" is
+/// every copy the sweep let go (room rule and real unmaps), and there is no
+/// out-of-memory fallback (0; refused allocations are in `residency`).
+#[cfg(windows)]
+pub(crate) fn housekeeping() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HOUSEKEEPING_LOG").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now < last + 5_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let mb = |b: u64| b >> 20;
+    static BEFORE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let [gone_now, again_now] = [KINDS[3].load(Relaxed), KINDS[5].load(Relaxed)];
+    let gone_since = gone_now.saturating_sub(BEFORE[0].swap(gone_now, Relaxed));
+    let again_since = again_now.saturating_sub(BEFORE[1].swap(again_now, Relaxed));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let [budget, raw] = memory.map_or([0, 0], |v| [v[0], v[1]]);
+    let net = raw.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    let share = |percent: u64| budget / 100 * percent;
+    let [windows, window_bytes] = crate::shadow::windows_alive();
+    let [_, windows_gone_bytes] = crate::shadow::windows_let_go();
+    let [unmapped_windows, unmapped_window_bytes] =
+        [0, 1].map(|i| crate::shadow::UNMAP_LET_GO[i].load(Relaxed));
+    let exact: [u64; 6] = std::array::from_fn(|i| EXACT[i].load(Relaxed));
+    let free_ram = crate::host::available_physical_ram().map_or(0, |b| b >> 20);
+    let blocks = crate::pool::texture_blocks();
+    tracing::info!(
+        "memory housekeeping: card {} MB in use ({} MB counting free heap space) of {} MB (high {} MB, low {} MB); texture copies alive {} MB, \
+         let go for room {} MB ({} MB in the last 5 s), made again {} MB ({} MB in the last 5 s); windows {} alive {} MB, let go {} MB; \
+         free RAM {} MB; let go on a real unmap {} ({} MB), held at a sweep {} times, mapped again {} (VICTORY_UNMAP_EXACT={}); \
+         title memory really unmapped {} MB in {} calls; out-of-memory fallback ran 0 times (none in this base; host memory \
+         pressure {}); windows let go on unmap {} ({} MB) (VICTORY_WINDOW_UNMAP={}); host lists idle {}, let go as idle {}          (VICTORY_LIST_POOL_IDLE_S); \
+         room rule let go {} ({} MB) in {} sweeps, raw guard ran {} s (VICTORY_VRAM_RAW_PCT={}); texture blocks {} alive ({} empty, {} given back this run); \
+         heaps by occupancy: <25 % {}, 25–50 % {}, 50–75 % {}, >75 % {}; free space inside heaps {} MB; \
+         copies let go to empty a sparse heap {} ({} MB) (VICTORY_HEAP_PACK={})",
+        mb(net),
+        mb(raw),
+        mb(budget),
+        mb(share(88)),
+        mb(share(85)),
+        mb(KINDS[1].load(Relaxed)),
+        mb(gone_now),
+        mb(gone_since),
+        mb(again_now),
+        mb(again_since),
+        windows,
+        mb(window_bytes),
+        mb(windows_gone_bytes),
+        free_ram,
+        exact[0],
+        mb(exact[1]),
+        exact[2],
+        exact[3],
+        u8::from(unmap_exact()),
+        mb(exact[5]),
+        exact[4],
+        if crate::residency::pressured() { "on" } else { "off" },
+        unmapped_windows,
+        mb(unmapped_window_bytes),
+        u8::from(crate::shadow::window_unmap()),
+        crate::list::idle_lists(),
+        crate::list::IDLE_LET_GO.load(Relaxed),
+        ROOM_LET_GO[0].load(Relaxed),
+        mb(ROOM_LET_GO[1].load(Relaxed)),
+        ROOM_LET_GO[2].load(Relaxed),
+        RAW_GUARD.load(Relaxed),
+        std::env::var("VICTORY_VRAM_RAW_PCT").unwrap_or_else(|_| "-".into()),
+        blocks[0],
+        blocks[6],
+        blocks[7],
+        blocks[1],
+        blocks[2],
+        blocks[3],
+        blocks[4],
+        mb(blocks[5]),
+        crate::pool::PACKED[0].load(Relaxed),
+        mb(crate::pool::PACKED[1].load(Relaxed)),
+        match crate::pool::heap_pack() {
+            (true, true) => "1",
+            (true, false) => "place",
+            _ => "0",
+        },
+    );
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2298,6 +2724,8 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            remade: Default::default(),
+            uploads: Default::default(),
             flags,
         }
     }
@@ -2323,6 +2751,8 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            remade: Default::default(),
+            uploads: Default::default(),
             flags,
         }
     }
@@ -3080,6 +3510,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    // (Fox port C2, F11) A description seen at another address: a level change moved it.
+    #[cfg(feature = "diagnostics")]
+    crate::texdetail::texture_made(address, desc);
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host

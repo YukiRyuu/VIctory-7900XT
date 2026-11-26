@@ -181,6 +181,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -496,63 +497,44 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
-/// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
-/// even), with results below the smallest normal float flushed to signed
-/// zero as the console's default float mode does.
-fn cvt_f32_f64_reference(x: f64) -> u32 {
-    let r = x as f32;
-    if r.is_subnormal() || (r == 0.0 && x != 0.0) {
-        r.to_bits() & 0x8000_0000
-    } else {
-        r.to_bits()
-    }
-}
-
+/// 64-bit floats, which the title's water volumetrics count their lanes in: `v_add_f64` and
+/// `v_mul_f64` of register pairs (one operand negated, one an inline double),
+/// `v_cvt_f64_f32`, and `v_cvt_f32_f64` rounding to nearest (1 + 0.75 of a float's last
+/// place becomes 1 + one place). The doubles come in s0..s3 (v1..v4): a in v[1:2], b in
+/// v[3:4].
 #[test]
-#[ignore = "expects results below the smallest normal float flushed to zero; the IEEE lowering (v_cvt_f32_f64_matches_ieee754) is kept until the console's mode is checked"]
-fn v_cvt_f32_f64_rounds_to_nearest_even() {
-    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x0f)
-    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
-    let tie_even = 1.0f64 + f64::from(f32::EPSILON) / 2.0; // ties to 1.0
-    let tie_odd = 1.0f64 + 1.5 * f64::from(f32::EPSILON); // ties up to 1 + 2 ulp
-    let values = [
-        0.0,
-        -0.0,
-        1.0,
-        -2.5,
-        std::f64::consts::PI,
-        1.0e-3,
-        123_456_789.123,
-        tie_even,
-        tie_odd,
-        1.0 + f64::from(f32::EPSILON) * 0.75,
-        f64::from(f32::MAX),
-        f64::from(f32::MAX) * 1.000_000_1, // rounds to infinity
-        1.0e300,
-        -1.0e300,
-        1.0e-40, // a float denormal: flushed
-        -1.0e-300,
-        f64::from(f32::MIN_POSITIVE),
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NAN,
+fn f64_arithmetic_and_conversions_are_ieee() {
+    let to_f32 = vop1(0x0F, 0, vgpr(5)); // v_cvt_f32_f64 v0, v[5:6]
+    let d = |a: f64, b: f64| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    };
+    let with = |first: &[u32]| {
+        let mut w = first.to_vec();
+        w.push(to_f32);
+        w
+    };
+    let add = with(&vop3(0x164, 5, vgpr(1), vgpr(3), 0)); // v_add_f64 v[5:6], v[1:2], v[3:4]
+    let neg_mul = with(&vop3_mod(0x165, 5, vgpr(1), vgpr(3), 0, 0, 1, 0, false)); // -a * b
+    let half = with(&vop3(0x164, 5, 240, vgpr(1), 0)); // v_add_f64 v[5:6], 0.5, v[1:2]
+    let mut wide = vec![vop1(0x10, 5, vgpr(1))]; // v_cvt_f64_f32 v[5:6], v1
+    wide.extend(vop3(0x164, 5, vgpr(5), vgpr(5), 0)); // v_add_f64 v[5:6], v[5:6], v[5:6]
+    wide.push(to_f32);
+    let near = 1.0 + 3.0 * 2f64.powi(-25);
+    let cases: [(&[u32], [u32; 4], f32); 6] = [
+        (&add, d(1.5, 2.25), 3.75),
+        (&add, d(near, 0.0), f32::from_bits(0x3F80_0001)),
+        (&add, d(1e300, -1e300), 0.0),
+        (&neg_mul, d(3.0, 0.5), -1.5),
+        (&half, d(2.0, 0.0), 2.5),
+        (&wide, [1.25f32.to_bits(), 0, 0, 0], 2.5),
     ];
-    let inputs: Vec<[u32; 4]> = values
-        .iter()
-        .map(|x| {
-            let b = x.to_bits();
-            [b as u32, (b >> 32) as u32, 0, 0]
-        })
-        .collect();
-    run_cases(&shader, &inputs, |backend, i, _, got| {
-        let x = values[i];
-        if x.is_nan() {
-            assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
-            return;
-        }
-        let want = cvt_f32_f64_reference(x);
-        assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
-    });
+    for (body, inputs, want) in cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(f32::from_bits(got), want, "{backend}: {body:08x?} on {inputs:08x?}");
+        });
+    }
 }
 
 /// The lane `v_permlane16_b32` (`cross` false) or `v_permlanex16_b32` reads
@@ -1649,6 +1631,81 @@ fn ds_min_max_f32_are_atomic_across_waves() {
     }
 }
 
+const DS_ADD_RTN_U32: u8 = 0x20;
+const DS_SUB_RTN_U32: u8 = 0x21;
+
+/// `buffer_store_dword v<data>, v<addr>, s[8:11], 0 offen offset:<offset>`.
+const fn store_at(data: u8, addr: u8, offset: u16) -> [u32; 2] {
+    [0xE070_1000 | offset as u32, 0x8002_0000 | (data as u32) << 8 | addr as u32]
+}
+
+/// One console wave of 32 threads takes slots off an LDS counter as the title's
+/// `weatherParticle:CS_BeginUpdate` does: `v_sub_nc_u32 v7, 0, v6` then `ds_add_rtn_u32` of
+/// that negation (HLSL's `InterlockedAdd(shared, -x)`), and the same with `ds_sub_rtn_u32`.
+/// NVIDIA's compiler refuses either as an atomic on group-shared memory (`E_OUTOFMEMORY` at
+/// pipeline creation, RTX 5090): the translation's compare-exchange loop gets a pipeline.
+/// Thread t takes t ^ s1 (s1 = 0x100, unknown to any compiler: the negation stays one) from
+/// 1,000,000; each must get the counter as it stood before its own subtraction, in some
+/// order of the threads, and the counter must end at the total.
+#[test]
+fn lds_subtractions_get_a_pipeline_and_stay_atomic() {
+    const INIT: u32 = 1_000_000;
+    const S1: u32 = 0x100;
+    for (op, negate, what) in [(DS_ADD_RTN_U32, true, "ds_add_rtn_u32 of 0 - x"), (DS_SUB_RTN_U32, false, "ds_sub_rtn_u32")] {
+        let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0: the counter's address
+        body.extend(ds(DS_WRITE_B32, 0, 5, 1)); // the counter = s0 (every thread the same)
+        body.push(S_BARRIER);
+        body.push(vop2(0x1D, 6, sgpr(1), 0)); // v_xor_b32 v6, s1, v0: x = t ^ s1
+        body.push(vop2(0x26, 7, 0x80, 6)); // v_sub_nc_u32 v7, 0, v6: -x
+        body.extend(ds(op, 2, 5, if negate { 7 } else { 6 })); // v2: the counter found
+        body.push(vop2(0x1A, 3, 0x82, 0)); // v_lshlrev_b32 v3, 2, v0
+        body.extend(store_at(2, 3, 4)); // dword t + 1: what thread t got
+        body.push(S_BARRIER);
+        body.extend(ds(DS_READ_B32, 0, 5, 0)); // dword 0: the counter at the end
+        let shader = build_cs(&body, 32, 512);
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        // (the refusal this is about: a pipeline must be made)
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{what}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [INIT, S1][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(33)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{what}: dispatch failed: {e}"));
+        let got = &out[0];
+        // In the order the subtractions took effect (largest counter first), each thread
+        // found what the one before left.
+        let mut order: Vec<(u32, u32)> = (0..32).map(|t| (got[t as usize + 1], t ^ S1)).collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let mut counter = INIT;
+        for (old, x) in order {
+            assert_eq!(old, counter, "{what}: the thread taking {x} found {old}, the counter stood at {counter}");
+            counter -= x;
+        }
+        assert_eq!(got[0], counter, "{what}: the counter at the end");
+        assert_eq!(counter, INIT - (0..32).map(|t| t ^ S1).sum::<u32>());
+    }
+    eprintln!("ran on the hardware device: LDS subtractions as compare-exchange loops, atomic");
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
@@ -1918,6 +1975,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2128,6 +2186,7 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2145,6 +2204,17 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
 /// GPU and WARP.
 #[test]
 fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
+    // (portB) cool_fox's view-kind path: a place only d16 accesses reach would otherwise be a
+    // halves place (`VICTORY_HALF_VIEWS`, see the test below), whose FLOAT views the host
+    // shows as their UINT twins, which this test host does not.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::lower::TEST_HALF_VIEWS.set(None);
+        }
+    }
+    let _reset = Reset;
+    super::lower::TEST_HALF_VIEWS.set(Some(false));
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_SINT,
         DXGI_FORMAT_R16G16B16A16_UINT,
@@ -2389,5 +2459,134 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
                 .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
             assert_eq!(out[0], want, "{backend} {label}: buffer_load_format_x mismatch");
         }
+    }
+}
+
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0` with `idxen` or `offen` and an immediate
+/// byte offset (soffset: the constant 0). (victory-dev D1)
+const fn mubuf_at(op: u8, vdata: u8, vaddr: u8, srsrc: u8, idxen: bool, offen: bool, offset: u32) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32) << 18 | (idxen as u32) << 13 | (offen as u32) << 12 | (offset & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// (portB; fxceless #927, `VICTORY_HALF_VIEWS`) A table place that only d16 accesses reach is
+/// a halves place: named to the host (`half_views`), lowered through an unsigned-integer
+/// handle (no view-kind root SRV asked for), and its 16 bits pass as they are, on the card
+/// and on WARP, through an R16G16B16A16_UINT view (the host shows a FLOAT view there as its
+/// UINT twin). With a whole-dword format load of the same place too it is no halves place,
+/// and cool_fox's view kinds take it (`SLOT_TABLE_STRIDES`).
+#[test]
+fn a_place_only_d16_accesses_reach_moves_its_halves_as_unsigned_integers() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
+    let program = |mixed: bool| {
+        let mut words = vec![s_mov_b32(5, 0x80)]; // s5 = 0: s[4:5] the table
+        words.extend_from_slice(&s_load_dwordx4_off(8, 4, 0)); // table[0]: the typed view
+        words.extend_from_slice(&s_load_dwordx4_off(12, 4, 32)); // table[1]: raw out
+        // buffer_load_format_d16_xyzw v[2:3], v0, s[8:11] idxen
+        words.extend_from_slice(&mubuf_at(0x83, 2, 0, 8, true, false, 0));
+        if mixed {
+            // buffer_load_format_x v6, v0, s[8:11] idxen
+            words.extend_from_slice(&mubuf_at(0x00, 6, 0, 8, true, false, 0));
+        }
+        words.push(0x3408_0083); // v_lshlrev_b32 v4, 3, v0
+        // buffer_store_dwordx2 v[2:3], v4, s[12:15] offen
+        words.extend_from_slice(&mubuf_at(0x1D, 2, 4, 12, false, true, 0));
+        if mixed {
+            words.extend_from_slice(&mubuf_at(0x1C, 6, 4, 12, false, true, 64));
+        }
+        words.push(S_ENDPGM);
+        words
+    };
+    let table = |kind, k: u32| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: k * 8,
+        lower_bound: k,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 0,
+    };
+    let lowered = |words: Vec<u32>| {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 1)],
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [4, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut l.dxil.clone()).expect("DXIL validation failed");
+        }
+        (l, res)
+    };
+    let (mixed, _) = lowered(program(true));
+    assert!(mixed.half_views.is_empty(), "a place read otherwise too is no halves place");
+    assert!(mixed.root_srvs.contains(&super::SLOT_TABLE_STRIDES), "cool_fox's view kinds take it");
+    let (l, res) = lowered(program(false));
+    assert_eq!(l.half_views, [(0, 0)], "the halves place: table at s4, dword 0");
+    assert!(!l.root_srvs.contains(&super::SLOT_TABLE_STRIDES), "no view-kind word needed");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: l.half_views,
+    };
+    let bits: [u32; 8] =
+        [0x3C00_0001, 0x7E00_BC00, 0xFFFF_8000, 0xABCD_1234, 0x0002_0000, 0x7BFF_FBFF, 0xDEAD_BEEF, 0xCAFE_BABE];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend} device; skipped");
+            continue;
+        };
+        let (root, pso) =
+            host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
+        let views = [
+            View::Buffer { data: &bits, stride: super::host::Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8) },
+            View::RawUav(8),
+        ];
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] },
+            )
+            .unwrap_or_else(|e| panic!("{backend}: dispatch failed: {e}"));
+        assert_eq!(out[0][..8], bits[..], "{backend}: buffer_load_format_d16_xyzw through a halves place");
     }
 }

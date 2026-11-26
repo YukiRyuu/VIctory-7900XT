@@ -16,6 +16,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub(crate) mod cause;
+pub(crate) mod delta;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -96,6 +98,9 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// (C3) `VICTORY_PARTIAL_DELTA=1`: which subresources the list's copy
+    /// leaves out ([`delta`]).
+    delta: Mutex<Option<delta::Plan>>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -175,12 +180,22 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
+/// (fxceless 19a45d1) Since the start: copies [`alias`] made into a view the
+/// list had used before (an upload from title memory), which it skipped before.
+pub(crate) static ALIAS_AFTER_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     // (All of its levels: the copy is level by level.)
     crate::resource::want_level(placed, 0);
+    // (C3) The card writes its host copy: no delta record of it.
+    if delta::on()
+        && let Some(copy) = crate::resource::made_copy(placed)
+    {
+        delta::forget(copy.serial);
+    }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
@@ -275,6 +290,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         }
     };
     let first = list.first_use(placed as usize);
+    // (fxceless 19a45d1, V1 visual fixes) An upload of this view from title
+    // memory earlier in the list has used its first use already: only a copy
+    // from the same card-written source satisfies this read (before: the
+    // copy was skipped and the shader read the uploaded bytes, zero where the
+    // card wrote packed light). Counted in [`ALIAS_AFTER_UPLOAD`].
+    let new_source = list.alias_source_changed(&to, &from);
+    if new_source && !first {
+        ALIAS_AFTER_UPLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -289,7 +313,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -830,12 +854,33 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
             _ => mapped_bytes(staging.memory, staging.read),
         };
         staging.expected.store(there, Relaxed);
+    }
+    // (C3) Uploads by cause, a line every 5 s (diagnostics).
+    let _first = copy.uploads.fetch_add(1, Relaxed) == 0;
+    #[cfg(feature = "diagnostics")]
+    cause::upload(_first, copy.remade.load(Relaxed), baking, staging.bytes);
+    // (C3) `VICTORY_PARTIAL_DELTA=1`: the subresources this host copy was
+    // given the same bytes for are left out of the list's copy ([`delta`]).
+    if delta::on() && picking.is_some() && !baking && copy.uploads.load(Relaxed) > 1 {
+        let mut plan = staging.delta.lock().unwrap_or_else(|e| e.into_inner());
+        if plan.is_none()
+            && staging.once.load(Relaxed)
+            && !staging.on_demand
+            && !staging.uploaded.load(Relaxed)
+            && let Some(spans) =
+                delta::spans(&staging.layout, (0..staging.footprints.len()).map(|i| staging.part(i)), staging.read)
+        {
+            *plan = Some(delta::plan(copy.serial, staging.memory, spans));
+        }
+        drop(plan);
+        delta::line();
     }
     record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
     // When the list is submitted, its copy takes what the staging buffer
@@ -891,9 +936,19 @@ fn record_upload(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
+    // (C3) `VICTORY_PARTIAL_DELTA`: the parts left out (none without it).
+    let skip: Vec<bool> = {
+        let plan = staging.delta.lock().unwrap_or_else(|e| e.into_inner());
+        match plan.as_ref() {
+            Some(plan) if plan.any_skipped() => (0..staging.footprints.len()).map(|i| plan.skips(i)).collect(),
+            _ => Vec::new(),
+        }
+    };
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // (Not before one that leaves parts out: this host copy was uploaded
+    // before, and the parts left out are its contents.)
+    if crate::pool::on() && !staging.uploaded.load(Relaxed) && skip.is_empty() {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -911,6 +966,9 @@ fn record_upload(
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging/plane upload buffer lives until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if skip.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -1222,7 +1280,14 @@ impl Staging {
     /// The host copy holds what the staging buffer was filled from
     /// ([`unchanged`]).
     fn note_held(&self) {
-        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        let mut hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        // (C3) A delta upload whose left-out parts the submission found
+        // changed (or did not read): the host copy does not hold the bytes.
+        if let Some(plan) = self.delta.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+            && !delta::settle(plan, self.memory as u64)
+        {
+            hash = None;
+        }
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
     }
 
@@ -1512,6 +1577,9 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // (C3) `VICTORY_PARTIAL_DELTA`: parts the list's copy leaves out are
+        // judged, not detiled; the others' bytes are recorded.
+        let mut plan = self.delta.lock().unwrap_or_else(|e| e.into_inner());
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1521,6 +1589,11 @@ impl Staging {
             // block of the pool goes on with another texture's.
             let len = (pitch * rows as usize * f.Depth as usize)
                 .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            if let Some(plan) = plan.as_mut()
+                && !delta::detiled(plan, i, tiled, len as u64)
+            {
+                continue;
+            }
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -1768,12 +1841,10 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
-    let end = start.saturating_add(len);
     // Streamed textures lie in views of physical pages, of which the runtime
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
@@ -1782,8 +1853,47 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
         && let Some(there) = crate::inplace::shown_bytes(start, len)
     {
+        // (Fox port C, `VICTORY_MAPPED_CHECK=1`; default 0 = cool_fox's
+        // behaviour, the views' answer alone; A/B candidate) A texture the views show only in part is asked of
+        // the host too, and the larger answer taken: run-100 had 52,004
+        // uploads of textures "not all mapped" and 4,681 "uploaded in
+        // part" at a time, against 72 and 1 in our tree asking the host for
+        // the same game, so the view record may miss memory that is there
+        // (each such texture then went up in part and was looked at again
+        // with back-off). Only partial answers pay for the question.
+        if there >= len as u64 || !mapped_check() {
+            return there;
+        }
+        let host = host_mapped_bytes(at, len);
+        MAPPED_CHECKED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if host > there {
+            MAPPED_CHECKED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if host >= len as u64 {
+                MAPPED_CHECKED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return host;
+        }
         return there;
     }
+    host_mapped_bytes(at, len)
+}
+
+/// (Fox port C) Whether a partial answer of the views is checked with the
+/// host ([`mapped_bytes`], `VICTORY_MAPPED_CHECK`).
+fn mapped_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// (Fox port C) Since the start: partial answers of the views checked with
+/// the host; of them, ones the host found more of; and of those, all there.
+pub(crate) static MAPPED_CHECKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`mapped_bytes`] asked of the host (not of the runtime's views).
+fn host_mapped_bytes(at: *const u8, len: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let start = at as usize;
+    let end = start.saturating_add(len);
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
@@ -1939,6 +2049,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        delta: Mutex::new(None),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

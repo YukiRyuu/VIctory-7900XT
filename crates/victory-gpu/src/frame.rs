@@ -80,7 +80,7 @@ pub(crate) extern "system" fn schedule(
 }
 
 /// Frames begun so far (frame waits that ended).
-pub(crate) fn current() -> u64 {
+pub fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
@@ -163,6 +163,12 @@ pub(crate) extern "system" fn wait(
         add(C::PaceWaits, 1);
         add(C::PaceUs, wait.min(limit).as_micros() as u64);
     }
+    #[cfg(windows)]
+    {
+        let us = wait.min(limit).as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
@@ -171,6 +177,7 @@ pub(crate) extern "system" fn wait(
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
         }
+        frame_began();
     }
     #[cfg(feature = "diagnostics")]
     tracing::debug!(
@@ -184,6 +191,32 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// Draws of the most recent frame (draws run on the host between two frame
+/// beginnings: the per-frame number the window caption averages as "N
+/// draws"), set when the title begins a frame; read by the scripted input
+/// (`VICTORY_AUTO_INPUT` waits such as `d>=40`).
+pub static PRESENTED_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The draw total when the last frame began.
+static DRAWN_AT_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// (Fox port A) A frame begins (an origin wait made a new token): the
+/// per-frame draw count for the scripted input, the frame log's frame end
+/// (`VICTORY_FRAME_LOG`) and the hang watch's start (`VICTORY_HANG_WATCH_S`).
+/// The fox base's host has no hooks of ours, so the frame boundary is the
+/// title's frame wait, which it makes once a frame.
+fn frame_began() {
+    #[cfg(windows)]
+    {
+        let drawn = crate::draw::drawn();
+        let before = DRAWN_AT_FRAME.swap(drawn, Ordering::Relaxed);
+        let draws = drawn.saturating_sub(before).min(u64::from(u32::MAX)) as u32;
+        PRESENTED_DRAWS.store(draws, Ordering::Relaxed);
+        crate::framelog::frame();
+        crate::hangwatch::start();
+    }
 }
 
 /// Device method: no statistics are kept, so none are returned.

@@ -708,6 +708,11 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    // (Fox port C, F21 chunk meter, `VICTORY_CHUNK_METER`) What our
+    // refreshes take from the title's chunk segment.
+    for &(src, _, len) in &copies {
+        crate::chunks::refreshed(src, src + len);
+    }
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
         wide(copy_jobs(copies));
@@ -2742,6 +2747,21 @@ mod stale_tests {
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// (Fox port C) For the housekeeping line: windows alive (each once) and
+/// their bytes.
+pub(crate) fn windows_alive() -> [u64; 2] {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let mut seen = std::collections::HashSet::new();
+    let bytes: u64 = loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| s.len).sum();
+    [seen.len() as u64, bytes]
+}
+
+/// (Fox port C) For the housekeeping line: windows let go since the start
+/// and their bytes.
+pub(crate) fn windows_let_go() -> [u64; 2] {
+    [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed)]
+}
+
 /// For the memory line: the windows let go since the start and their
 /// bytes, and of the bytes of the windows alive, how many lie between the
 /// lowest and the highest address ever asked for in each.
@@ -2810,6 +2830,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // (Fox port C, `VICTORY_WINDOW_UNMAP`) Windows under memory the title
+    // unmapped go first.
+    let_go_unmapped();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2840,6 +2863,122 @@ pub(crate) fn let_go_idle() {
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
+        crate::host::retire(shadow);
+    }
+}
+
+/// (Fox port C, from victory-dev) Whether windows of title memory outside
+/// buffers go at the next sweep once the title unmapped all memory under
+/// them (`VICTORY_WINDOW_UNMAP=1`; default 0 = cool_fox's behaviour, only
+/// by idle time; A/B candidate). Run-98 let 1,270 windows (6.5 GB) go this way; cool_fox
+/// keeps them for the idle time (10 s here, 5 min on a PC with 12 GiB free)
+/// whether or not anything is mapped under them.
+pub(crate) fn window_unmap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UNMAP").is_some_and(|v| v == "1"))
+}
+
+/// Title memory unmapped since the last sweep, kept as
+/// `crate::resource::keep_exact` keeps it; and the windows found unmapped
+/// that something still held, by key, looked at again at each sweep.
+static WINDOW_UNMAPPED: Mutex<(Vec<(u64, u64)>, Vec<(u64, u64)>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// The most windows looked at again ([`WINDOW_UNMAPPED`]'s second list).
+const PENDING_MOST: usize = 1 << 14;
+
+/// Windows let go because the title unmapped all memory under them, since
+/// the start, and their bytes.
+pub(crate) static UNMAP_LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The runtime unmaps `[at, at + len)`: recorded for the next sweep
+/// ([`let_go_unmapped`]); one lock, no walk.
+pub(crate) fn note_window_unmapped(at: u64, len: u64) {
+    if !window_unmap() || len == 0 {
+        return;
+    }
+    let mut u = WINDOW_UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    crate::resource::keep_exact(&mut u.0, at, len, 1024);
+}
+
+/// Of `keys` (start, bytes; sorted, none longer than `longest`) the windows
+/// that share a byte with one of `ranges` (start, bytes).
+fn windows_under(keys: &[(u64, u64)], ranges: &[(u64, u64)], longest: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(start, len) in ranges {
+        let end = start.saturating_add(len);
+        let from = keys.partition_point(|k| k.0 < start.saturating_sub(longest));
+        out.extend(keys[from..].iter().take_while(|k| k.0 < end).filter(|k| k.0 + k.1 > start).copied());
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// [`window_unmap`]: lets go of the windows outside buffers under memory
+/// the title unmapped of which no page is mapped now
+/// (`crate::resource::mapped_now`), when nothing holds them (as
+/// [`let_go_idle`] asks: only the table holds the copy, no slot views its
+/// buffer), through `crate::host::retire`. A held window is looked at again
+/// at the next sweep; one mapped again stays.
+fn let_go_unmapped() {
+    if !window_unmap() {
+        return;
+    }
+    let (ranges, pending) = std::mem::take(&mut *WINDOW_UNMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+    if ranges.is_empty() && pending.is_empty() {
+        return;
+    }
+    let mut keys: Vec<(u64, u64)> = {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let all: Vec<(u64, u64)> = map.iter().filter(|(_, s)| s.place.is_none()).map(|(key, _)| *key).collect();
+        let longest = all.iter().map(|k| k.1).max().unwrap_or(0);
+        let mut keys = windows_under(&all, &ranges, longest);
+        keys.extend(pending.into_iter().filter(|key| map.contains_key(key)));
+        keys
+    };
+    keys.sort_unstable();
+    keys.dedup();
+    let free = |s: &Arc<Shadow>| Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let mut again: Vec<(u64, u64)> = Vec::new();
+    for key in keys {
+        // Out of the windows' lock: this takes the mapping hold (without
+        // waiting) and the views' lock.
+        match crate::resource::mapped_now(key.0, key.1) {
+            Some(true) => continue,
+            None => {
+                again.push(key);
+                continue;
+            }
+            Some(false) => {}
+        }
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        match map.get(&key).map(free) {
+            Some(true) => gone.extend(map.remove(&key)),
+            Some(false) => again.push(key),
+            None => {}
+        }
+    }
+    if !again.is_empty() {
+        let mut u = WINDOW_UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        u.1.extend(again);
+        u.1.sort_unstable();
+        u.1.dedup();
+        u.1.truncate(PENDING_MOST);
+    }
+    if gone.is_empty() {
+        return;
+    }
+    let bytes: u64 = gone.iter().map(|s| s.len).sum();
+    UNMAP_LET_GO[0].fetch_add(gone.len() as u64, Ordering::Relaxed);
+    UNMAP_LET_GO[1].fetch_add(bytes, Ordering::Relaxed);
+    let went = gone.len();
+    crate::host::trail(|| {
+        format!("sweep: {went} host copies of windows of title memory let go ({} KiB): the title unmapped all memory under them", bytes >> 10)
+    });
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         crate::host::retire(shadow);
     }
 }
@@ -3844,6 +3983,8 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        // (Fox port C, F21 chunk meter) What our refreshes take from the title's chunk segment.
+        crate::chunks::refreshed(from, to);
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();

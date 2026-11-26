@@ -403,6 +403,47 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 }
 
 /// What one title list has set, and what its host list was last given.
+/// (Fox port C2, from victory-dev P3; `VICTORY_BIND_FILTER=1`, default off =
+/// cool_fox) Root arguments a draw would give the host list again unchanged
+/// are left out. D3D12 keeps root arguments from one draw to the next until a
+/// root signature is set; fox sets the root signature only when it changes
+/// (`State::host_roots`, zeroed by every pass of ours that binds its own and
+/// by `replay`), and this record is cleared with it. Fox's `BIND_CACHE`
+/// covers targets and pipelines only. Counted in "bind filter: root
+/// arguments given N, left out M" with the copystat lines.
+pub(crate) fn bind_filter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_FILTER").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_BIND_FILTER`) Since the start: root arguments given, left out.
+pub(crate) static FILTERED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Counts one root argument given or left out; a line every 2^20 of them.
+fn filtered(same: bool) {
+    let n = FILTERED[usize::from(same)].fetch_add(1, Ordering::Relaxed) + 1;
+    if !same && n.is_multiple_of(1 << 20) {
+        tracing::info!(
+            "bind filter (VICTORY_BIND_FILTER=1), since the start: root arguments given {}, left out as unchanged {}",
+            n,
+            FILTERED[1].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// (`VICTORY_BIND_FILTER`) A root argument as last given to the host list.
+#[derive(Debug, Clone, PartialEq, Default)]
+enum GivenRoot {
+    #[default]
+    None,
+    /// Root constants, all the parameter's words.
+    Words(Vec<u32>),
+    /// A root view: constant buffer 0, shader resource 1; its GPU address.
+    View(u8, u64),
+    /// A descriptor table's first host descriptor.
+    Table(u64),
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -427,6 +468,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// (fxceless a35c557, V1 visual fixes) The formats of the views [`State::set_targets`]
+    /// bound on the host list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -454,6 +499,9 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    /// (Fox port C2, `VICTORY_BIND_FILTER`) Root arguments as last given to
+    /// the host list, graphics and compute, by parameter.
+    given: [Vec<GivenRoot>; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
@@ -1141,6 +1189,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // (fxceless a35c557) The formats of the host views, for the draws' pipelines.
+        let mut formats = [0u32; 9];
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1160,6 +1210,9 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    if views.len() < 8 {
+                        formats[views.len()] = desc.Format.0 as u32;
+                    }
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
@@ -1168,6 +1221,9 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            if views.len() < 8 {
+                formats[views.len()] = bound_format(texture, record.desc().map(|d| d.Format));
+            }
             views.push((Some(texture), record.desc()));
             keys.push((texture.as_raw() as usize, record.key()));
         }
@@ -1177,6 +1233,7 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            formats[8] = bound_format(texture, record.depth_desc().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1184,6 +1241,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1266,6 +1324,7 @@ impl State {
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
+        self.given = [Vec::new(), Vec::new()];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
         if self.topology_set {
@@ -1461,7 +1520,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1551,6 +1610,49 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// (`VICTORY_BIND_FILTER`) Whether root parameter `param` holds `value`
+    /// on the host list; noted as what it holds if not (the caller sets it).
+    fn same_root(&mut self, compute: bool, param: u32, value: GivenRoot) -> bool {
+        if !bind_filter() {
+            return false;
+        }
+        let roots = &mut self.given[usize::from(compute)];
+        let p = param as usize;
+        if roots.len() <= p {
+            roots.resize(p + 1, GivenRoot::None);
+        }
+        let same = roots[p] == value;
+        if !same {
+            roots[p] = value;
+        }
+        filtered(same);
+        same
+    }
+
+    /// [`State::same_root`] for root constants given whole.
+    fn same_words(&mut self, compute: bool, param: u32, values: &[u32]) -> bool {
+        if !bind_filter() {
+            return false;
+        }
+        let roots = &mut self.given[usize::from(compute)];
+        let p = param as usize;
+        if roots.len() <= p {
+            roots.resize(p + 1, GivenRoot::None);
+        }
+        let same = matches!(&roots[p], GivenRoot::Words(w) if w.as_slice() == values);
+        if !same {
+            match &mut roots[p] {
+                GivenRoot::Words(w) => {
+                    w.clear();
+                    w.extend_from_slice(values);
+                }
+                r => *r = GivenRoot::Words(values.to_vec()),
+            }
+        }
+        filtered(same);
+        same
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
@@ -1618,6 +1720,8 @@ impl State {
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
+            // (`VICTORY_BIND_FILTER`) The host list's root arguments of this kind are gone.
+            self.given[usize::from(compute)].clear();
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1640,6 +1744,15 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            // (fxceless #927, coder B's host half) The table places this stage moves
+            // 16-bit halves through.
+            HALF_PLACES.with_borrow_mut(|h| {
+                h.clear();
+                h.extend_from_slice(&t.host.half_views);
+            });
+            if !t.host.half_views.is_empty() {
+                note_half_views(&p.name, &stage.shader.hash, &t.host.half_views);
+            }
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
@@ -1704,12 +1817,14 @@ impl State {
                     self.user.clear();
                     self.user.extend_from_slice(values);
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if !self.same_words(compute, param, values) {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -1720,11 +1835,13 @@ impl State {
                         if let Some(m) = &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
+                            if !self.same_root(compute, param, GivenRoot::View(1, m.directory)) {
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, m.directory);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, m.directory);
+                                    }
                                 }
                             }
                         }
@@ -1798,6 +1915,9 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    if self.same_root(compute, param, GivenRoot::View(u8::from(srv), gpu)) {
+                        continue;
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -1954,6 +2074,9 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
+        if self.same_root(compute, param, GivenRoot::Table(handle.ptr)) {
+            return true;
+        }
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
@@ -2040,6 +2163,9 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
+        if self.same_root(compute, param, GivenRoot::Table(handle.ptr)) {
+            return true;
+        }
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
@@ -2216,7 +2342,7 @@ impl State {
                         {
                             let was_staged = crate::texture::is_staged(resource);
                             let _ = crate::residency::take_staging_deferred();
-                            readable(list, sampled.kind, &view);
+                            readable(list, sampled.kind, &view, 0);
                             let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
                             if !was_staged {
                                 crate::texture::unstage(resource);
@@ -2525,7 +2651,7 @@ impl State {
             Some(mb) => mb << 20,
             None => {
                 let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
-                if crate::residency::limited_host_ram() {
+                if crate::residency::soft_caps() && crate::residency::limited_host_ram() {
                     base.min(128 << 20)
                 } else {
                     base
@@ -2648,13 +2774,9 @@ impl State {
         let bytes_at_most = if required || asked.is_some() {
             bytes_at_most
         } else {
-            crate::residency::prefetch_limit(
-                bytes_at_most,
-                crate::residency::pressured(),
-                crate::residency::critical_commit(),
-                crate::residency::limited_host_ram(),
-                crate::texture::live_staging_bytes(),
-            )
+            // (Fox port C) `VICTORY_TEXTURE_RAM_CAPS=1` takes all of
+            // cool_fox's caps; by default only the critical one.
+            crate::residency::texture_pass_limit(bytes_at_most)
         };
 
         let began = std::time::Instant::now();
@@ -2692,6 +2814,8 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
+            // (C3) Why an upload recorded below happens (`texture::cause`).
+            let mut cause = crate::texture::cause::OTHER;
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2706,6 +2830,7 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                cause = crate::texture::cause::CHANGED;
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2940,7 +3065,9 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
-                readable(list, sampled.kind, view);
+                crate::texture::cause::NEXT.set(if partly.is_some() { crate::texture::cause::PARTIAL } else { cause });
+                readable(list, sampled.kind, view, 0);
+                crate::texture::cause::NEXT.set(crate::texture::cause::OTHER);
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.
@@ -3023,6 +3150,16 @@ impl State {
             } else {
                 None
             };
+            // (C3) `VICTORY_REMAP_MARKS=guard`: writes through another view
+            // of its pages are told from now on (`watch::remap_marks`).
+            if crate::watch::remap_marks() != 0 {
+                if crate::watch::remap_marks() & 2 != 0
+                    && let Some((at, len)) = crate::texture::staged_memory(resource)
+                {
+                    crate::watch::guard_shown_elsewhere(at as usize, len as usize);
+                }
+                crate::watch::remap_marks_line();
+            }
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
@@ -3151,6 +3288,10 @@ impl State {
             if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+                // (`VICTORY_BIND_FILTER`) Set outside the record.
+                if let Some(g) = self.given[1].get_mut(param as usize) {
+                    *g = GivenRoot::None;
+                }
             }
         }
         // SAFETY: an open list with everything set.
@@ -3604,7 +3745,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, handle);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3645,6 +3786,27 @@ impl State {
                 };
             if needs_snapshot {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            }
+        }
+        // (fxceless #927) A table with a 16-bit float or signed buffer view at a place the
+        // shader moves halves through is made afresh too, with that view in the unsigned
+        // format of the same layout (`descriptor::host::half_view`); the title's own slot
+        // keeps the title's format for the shaders that read it as floats.
+        let half: Vec<(u8, u32)> = HALF_PLACES.with_borrow(|h| h.clone());
+        for &(slot, at) in &half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
             }
         }
         for &(g, e) in &plan.direct {
@@ -3704,7 +3866,9 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                // (fxceless #927) A table made with unsigned twins is another table.
+                let twins = half.iter().any(|&(s, _)| s == slot);
+                (table, n, if twins { h.0 ^ 0x9e37_79b9_7f4a_7c15 } else { h.0 })
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -3728,7 +3892,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, handle);
                     }
                 }
                 for k in selected {
@@ -3739,7 +3903,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, handle);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -3795,6 +3959,7 @@ impl State {
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
+                    && !half.contains(&(slot, k * 8))
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -3812,7 +3977,7 @@ impl State {
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, 0);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -3847,12 +4012,24 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        // (fxceless #927) The unsigned twin where the shader moves halves.
+                        let twin = if half.contains(&(slot, k * 8)) {
+                            crate::descriptor::host::half_view(&view)
+                        } else {
+                            None
+                        };
+                        match twin {
+                            Some(twin) => {
+                                HALF_VIEWS_SHOWN.fetch_add(1, Ordering::Relaxed);
+                                host.make_at(index, &twin);
+                            }
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, 0);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4479,6 +4656,45 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
+thread_local! {
+    /// (fxceless #927) While a stage's tables are made: the table places it moves 16-bit
+    /// halves through (`HostShader::half_views`).
+    static HALF_PLACES: std::cell::RefCell<Vec<(u8, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// (fxceless #927) Since the start: host slots of tables made with the unsigned twin of a
+/// 16-bit float or signed buffer view (`descriptor::host::half_view`).
+pub(crate) static HALF_VIEWS_SHOWN: AtomicU64 = AtomicU64::new(0);
+
+/// (fxceless #927) Logs, once per shader (at most 256), that a stage moves 16-bit halves as
+/// unsigned integers through table places: the face programs (`compute_graph_ops`,
+/// `ped_standard_head_cs`, `ped_skinning_cs`) should show here.
+fn note_half_views(pipeline: &str, shader: &str, places: &[(u8, u32)]) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    if seen.len() >= 256 || !seen.insert(shader.to_owned()) {
+        return;
+    }
+    tracing::info!(
+        pipeline,
+        shader,
+        places = ?places,
+        "a shader moves 16-bit halves as unsigned integers through these table places (root parameter, dword):          16-bit float views there are shown as their unsigned twin (VICTORY_HALF_VIEWS=0: off, needs a re-warmed shader cache)"
+    );
+}
+
+/// (fxceless a35c557) The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's own, which is what
+/// the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 /// The host state a depth view needs of its texture: the read state if the
 /// view writes no plane the format has (the title's read-only flags), else
 /// the write state.
@@ -4584,9 +4800,18 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// `record`: the title descriptor the view is in (0: not known), for the
+/// texture detail meter (`VICTORY_TEXTURE_DETAIL`).
+fn readable(list: &HostList, kind: ResourceType, view: &View, record: u64) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    // (Fox port C2, F11) The texture views draws bind, meter only.
+    #[cfg(feature = "diagnostics")]
+    if kind == ResourceType::Srv {
+        crate::texdetail::bound(view, placed.as_ref(), record);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = record;
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.

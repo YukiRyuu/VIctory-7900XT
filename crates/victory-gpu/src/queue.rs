@@ -569,6 +569,20 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    let _site = crate::hangwatch::at(&"title call: ExecuteCommandLists (queue::execute)");
+    // (Fox port C) The title's submit calls, for the frame log.
+    #[cfg(windows)]
+    struct Timed(std::time::Instant);
+    #[cfg(windows)]
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            let us = self.0.elapsed().as_micros() as u64;
+            crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+            crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+        }
+    }
+    #[cfg(windows)]
+    let _timed = Timed(std::time::Instant::now());
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -706,6 +720,7 @@ extern "system" fn signal2_x(
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+    let _site = crate::hangwatch::at(&"title call: queue Signal (queue::signal)");
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -737,6 +752,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    let _site = crate::hangwatch::at(&"title call: queue Wait (queue::wait)");
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -900,6 +916,15 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = this;
+    // (Fox port C) The title's present call, for the frame log.
+    struct Presenting(std::time::Instant);
+    impl Drop for Presenting {
+        fn drop(&mut self) {
+            crate::framelog::add(crate::framelog::T::PresentUs, self.0.elapsed().as_micros() as u64);
+        }
+    }
+    let _presenting = Presenting(std::time::Instant::now());
+    let _site = crate::hangwatch::at(&"title call: Present (queue::present)");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");

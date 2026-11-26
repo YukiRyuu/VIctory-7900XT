@@ -146,6 +146,45 @@ pub(crate) fn critical_commit() -> bool {
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
 }
 
+/// (Fox port C) Which host-RAM caps the texture pass picked by index takes
+/// (`VICTORY_TEXTURE_RAM_CAPS`, default 1 = cool_fox's behaviour, all
+/// caps; A/B candidate): 0 only the critical clause
+/// (commit under 1.5 GiB or an out-of-memory return in the last 500 ms:
+/// 16 MiB a frame); 1 also the soft ones of cool_fox (64 MiB a frame under
+/// pressure or on a <= 32 GiB PC with >= 1 GiB of staging alive, and the
+/// 128 MiB base on a <= 32 GiB PC, as in cool_fox). On our PC (32 GB, run-100) pressure
+/// was on for most of the run from 2.9 GB free physical memory alone, and
+/// the soft caps cut the pass to a third of ours (192 MiB): textures came
+/// later ("due" 58,726 against 29,900). The critical clause alone still
+/// guards against aborts.
+pub(crate) fn soft_caps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_RAM_CAPS").is_none_or(|v| v != "0");
+        tracing::info!(
+            "texture pass picked by index under host-RAM pressure: {} (VICTORY_TEXTURE_RAM_CAPS={})",
+            if on { "soft caps of 64 / 128 MiB a frame and the critical 16 MiB" } else { "only the critical 16 MiB cap (commit < 1.5 GiB or out of memory)" },
+            u8::from(on)
+        );
+        on
+    })
+}
+
+/// Frames whose texture pass a host-RAM cap made smaller, since the start:
+/// by the critical clause, by the soft ones.
+pub(crate) static CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`prefetch_limit`] as the pass takes it ([`soft_caps`]), counted.
+pub(crate) fn texture_pass_limit(bytes: u64) -> u64 {
+    let critical = critical_commit();
+    let soft = soft_caps();
+    let limit = prefetch_limit(bytes, soft && pressured(), critical, soft && limited_host_ram(), crate::texture::live_staging_bytes());
+    if limit < bytes {
+        CAPPED[usize::from(!critical)].fetch_add(1, Ordering::Relaxed);
+    }
+    limit
+}
+
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {

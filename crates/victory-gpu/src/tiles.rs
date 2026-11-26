@@ -645,11 +645,18 @@ impl Drop for Tiled {
     }
 }
 
+/// Views moved by [`show_from`] whose `ResourceMinLODClamp` was above 0 and
+/// is now kept as it is (before fxceless 41f9857 it was lowered by the shift).
+pub(crate) static KEPT_MIN_LOD: AtomicU64 = AtomicU64::new(0);
+
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
+/// resource, so moving the start of the view keeps that field as the title
+/// set it (fxceless 41f9857, V1 visual fixes): lowered, the view could
+/// sample a level the title held back. [`KEPT_MIN_LOD`] counts the views
+/// where that mattered.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
@@ -664,7 +671,7 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
         if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
+            KEPT_MIN_LOD.fetch_add(1, Ordering::Relaxed);
         }
     };
     match desc.ViewDimension {
@@ -1481,7 +1488,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_from_clamps_2d_and_2d_array_and_keeps_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1501,7 +1508,7 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1523,7 +1530,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, 1.5);
     }
 
     #[test]

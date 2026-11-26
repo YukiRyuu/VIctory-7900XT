@@ -1496,6 +1496,23 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DYNAMIC << 2)
     });
+    // (Fox port C2, from victory-dev; F19 `VICTORY_CHUNK_COUNT=N`, unset = fox)
+    // The title's view heap spans its chunk segment: 8,192 slots per 256 KiB
+    // chunk (32 chunks = 2^18). With more chunks asked for and no
+    // `VICTORY_DYNAMIC_SLOTS`, the dynamic slots scale with them (on a capped
+    // host heap at most half of it, as in the old tree).
+    static SCALED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let scaled = *SCALED.get_or_init(|| {
+        if std::env::var_os("VICTORY_DYNAMIC_SLOTS").is_some() {
+            return None;
+        }
+        let n = std::env::var("VICTORY_CHUNK_COUNT").ok().and_then(|v| v.trim().parse::<u32>().ok())?.clamp(5, 120);
+        tracing::warn!(chunks = n, slots = n * 8192, "dynamic descriptor slots scaled with VICTORY_CHUNK_COUNT (8,192 a chunk)");
+        Some(n * 8192)
+    });
+    if let Some(slots) = scaled {
+        return if null == 0 { slots.clamp(DYNAMIC, 1 << 21) } else { slots.clamp(DYNAMIC, (null / 2).max(DYNAMIC)) };
+    }
     if null < PORTABLE_VIEWS {
         return DYNAMIC;
     }
@@ -4402,6 +4419,65 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// (fxceless #927 via trustno1 77e13a9) The unsigned integer format with the layout of a
+/// 16-bit float or signed integer format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// (fxceless #927) `view` as a shader is shown it where it moves a buffer's 16-bit channels
+/// as unsigned integers (`victory_shader::emit::HostShader::half_views`): a buffer view in a
+/// 16-bit float or signed format, in the unsigned format of the same layout, through which
+/// every 16-bit pattern is read and stored as it is. `None` for every other view: the
+/// title's own serves.
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// (fxceless #927) The format of `view`, a buffer view through which a shader moves 16-bit
+/// channels as unsigned integers, if those integers are not what the console gives (wider,
+/// normalised or signed 8-bit channels, which the console converts). `None` for the formats
+/// the integers serve exactly, and for anything not a buffer view.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then R10G10B10A2, R8G8B8A8,
+    // R8G8 and R8 unsigned.
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => desc[0],
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
+}
+
 /// Whether a slot written with another view of the placed texture it
 /// shows keeps showing the old one until the new is made;
 /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
@@ -4858,6 +4934,30 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (fxceless #927) The unsigned twin of a 16-bit float or signed format has its layout,
+    /// and only buffer views in such a format are shown as another view.
+    #[test]
+    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
+        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
+            assert_eq!(half_format(format), Some(unsigned));
+        }
+        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
+            assert_eq!(half_format(other), None, "format {other}");
+        }
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
+            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
+        );
+        assert_eq!(half_view(&View::Shader(7, Some(words(54, BUFFER)))), Some(View::Shader(7, Some(words(57, BUFFER)))));
+        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))), None);
+        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
+        assert_eq!(half_view(&View::Shader(7, None)), None);
+        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, BUFFER)))), Some(41));
+        assert_eq!(half_inexact(&View::Shader(7, Some(words(12, BUFFER)))), None);
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.

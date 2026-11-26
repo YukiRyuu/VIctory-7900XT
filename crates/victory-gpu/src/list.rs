@@ -214,7 +214,7 @@ impl Detached {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -262,13 +262,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -295,10 +295,60 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST_UPLOAD {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, crate::host::moment()));
             idle.1 += bytes;
         }
     }
+}
+
+/// (Fox port C, from victory-dev) The seconds a host list may stay idle
+/// before it goes (`VICTORY_LIST_POOL_IDLE_S`; default 0 = cool_fox's
+/// behaviour, kept; ours ran 10; A/B candidate for RAM). An idle list keeps its two command allocators, and the driver
+/// keeps what the longest recording each held needed with them over a
+/// reset: up to 512 such lists stayed for the whole run (cool_fox's own
+/// count: "lists' allocators 9 GB" of 40-46 GB private).
+#[cfg(windows)]
+fn idle_list_ms() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |s| s.min(3600))
+    }) * 1000
+}
+
+/// Lets go of the host lists that stayed idle for [`idle_list_ms`] and 60
+/// frames. The pool takes the newest list first, so the oldest are those a
+/// burst left. Called once a second by the sweep; an idle list has run and
+/// was reset, so nothing in the air names it.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_lists() {
+    let ms = idle_list_ms();
+    if ms == 0 || !pools() {
+        return;
+    }
+    let went: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let old = idle.0.iter().take_while(|Idle(_, _, put)| crate::host::long_ago(*put, ms, 60)).count();
+        let went: Vec<Idle> = idle.0.drain(..old).collect();
+        idle.1 -= went.iter().map(|Idle(_, bytes, _)| bytes).sum::<u64>();
+        went
+    };
+    if went.is_empty() {
+        return;
+    }
+    let n = went.len() as u64;
+    IDLE_LET_GO.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    drop(went);
+    crate::host::trail(|| format!("sweep: {n} idle host lists let go"));
+}
+
+/// Host lists let go as idle since the start ([`let_go_idle_lists`]).
+#[cfg(windows)]
+pub(crate) static IDLE_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the housekeeping line: host lists idle now.
+#[cfg(windows)]
+pub(crate) fn idle_lists() -> u64 {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() as u64
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut

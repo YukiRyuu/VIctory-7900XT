@@ -66,7 +66,11 @@ impl Sums {
 
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SPANS").is_some_and(|v| v == "1"))
+    // (Fox port C) `VICTORY_CARD_METER=1`, our card meter's switch, asks for them
+    // too: they feed the frame log's card column ("all other lists").
+    *ON.get_or_init(|| {
+        ["VICTORY_CARD_SPANS", "VICTORY_CARD_METER"].iter().any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    })
 }
 
 static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
@@ -98,7 +102,16 @@ impl Host {
             at.add(1).write_volatile(0);
             read
         };
+        let before = spans.sums.busy;
         spans.sums.add(start, end);
+        // (Fox port C) The card's time on this submission, for the frame log
+        // (`crate::framelog`'s "all other lists": every list of the submission,
+        // ours inside it included; as read a ring of submissions later).
+        let took = spans.sums.busy - before;
+        if took > 0 {
+            crate::framelog::add(crate::framelog::T::CardListsUs, (took as f64 / spans.ticks_per_ms * 1000.0) as u64);
+            crate::framelog::add(crate::framelog::T::CardLists, 1);
+        }
         Some([spans.lists[2 * i].clone(), spans.lists[2 * i + 1].clone()])
     }
 

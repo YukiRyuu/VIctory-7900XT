@@ -87,6 +87,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    super::container::one_mode_per_register(&mut outputs, false);
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
@@ -415,6 +416,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         (
             host(crate::native::HwStage::Vs, vs),

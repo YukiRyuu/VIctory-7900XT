@@ -1978,9 +1978,21 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
     if !aliased.is_empty() {
         let one = open_one_view();
+        let marks = remap_marks() != 0;
         for block in aliased {
             g.aliased.remove(block);
             for other in crate::inplace::pages_of(block * BLOCK) {
+                // (C3) `VICTORY_REMAP_MARKS`: the page is written through one
+                // of its views (a fault, our write, the kernel's): a placed
+                // texture at any of its views changed with nothing else to
+                // tell of it (textures picked by index are not guarded
+                // themselves). Its slots are looked at by the next texture
+                // pass, as for a mapping (`descriptor::host::remapped`:
+                // locks one mutex of its own and calls nothing).
+                if marks {
+                    crate::descriptor::host::remapped(other & !(BLOCK - 1), BLOCK);
+                    REMAP_MARKED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let other = other / BLOCK;
                 if one {
                     // Before the first can be written.
@@ -1999,6 +2011,74 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     }
     unguard(g, &blocks);
     here
+}
+
+/// (C3, item 1b) `VICTORY_REMAP_MARKS`, default off. Why "a texture picked
+/// by index changed after its upload with nothing to tell of it": such a
+/// texture is uploaded once with no write-watch asking and no guard
+/// (`VICTORY_TEXTURE_ONCE`), and the title writes its pages through another
+/// view (the warning's `blocks_shown_elsewhere`). A guarded block whose page
+/// is shown elsewhere is guarded together with its other views ([`cover`]);
+/// a write through any of them faults and [`open`]s them all, but nothing
+/// told the texture pass. `=1`: [`open`] marks every view of such a page for
+/// the next texture pass (`descriptor::host::remapped`), so the texture is
+/// uploaded again at once instead of found changed by the recheck frames
+/// later. `=guard`: also, after the upload of a texture picked by index whose
+/// pages are shown elsewhere, its memory is guarded (with those views), so a
+/// write through any view is told even where nothing else guards them.
+/// Counter: "remap marks" in the texture-pass line ([`remap_marks_line`]).
+pub(crate) fn remap_marks() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_REMAP_MARKS").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("guard") => 3,
+        _ => 0,
+    })
+}
+
+/// Since the last line: pages marked by [`open`]; textures guarded after
+/// their upload (`=guard`); of those, ones whose guarding failed in part.
+pub(crate) static REMAP_MARKED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `VICTORY_REMAP_MARKS=guard`: guards title memory `[at, at + len)` of a
+/// texture picked by index just uploaded, if any of its pages is shown at
+/// another address too. Called without the heap's locks being needed by
+/// anything the guards' lock holder takes ([`open`] takes only the views'
+/// and the remapped ranges' locks).
+pub(crate) fn guard_shown_elsewhere(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if remap_marks() & 2 == 0 || len == 0 {
+        return;
+    }
+    if crate::inplace::shown_elsewhere(at & !(BLOCK - 1), at.saturating_add(len)).is_empty() {
+        return;
+    }
+    REMAP_MARKED[1].fetch_add(1, Relaxed);
+    if writes(at, at.saturating_add(len), true).is_none() {
+        REMAP_MARKED[2].fetch_add(1, Relaxed);
+    }
+}
+
+/// The "remap marks" line, every five seconds while the switch is on.
+pub(crate) fn remap_marks_line() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LINE_MS: AtomicU64 = AtomicU64::new(0);
+    if remap_marks() == 0 {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let last = LINE_MS.load(Relaxed);
+    if now < last + 5000 || LINE_MS.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let n: Vec<u64> = REMAP_MARKED.iter().map(|n| n.swap(0, Relaxed)).collect();
+    tracing::info!(
+        "remap marks (VICTORY_REMAP_MARKS), last 5 s: {} pages of written views marked for the texture pass; {} textures guarded after upload ({} not all guarded)",
+        n[0],
+        n[1],
+        n[2]
+    );
 }
 
 /// Gives write access back to `blocks`, guarded ones.
@@ -2244,10 +2324,12 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // (Fox port C) From asking for the lock until it is let go (the frame log).
+        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
         // The change is done: what is there now may be guarded.
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
@@ -2401,10 +2483,13 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    let asked = std::time::Instant::now();
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    crate::framelog::add(crate::framelog::T::Remaps, 1);
+    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -2440,6 +2525,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _timed = crate::framelog::Timed::new(crate::framelog::T::RemapNotesNs);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -2450,6 +2536,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    let _timed = crate::framelog::Timed::new(crate::framelog::T::RemapNotesNs);
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
