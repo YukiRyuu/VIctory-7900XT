@@ -5,6 +5,18 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## Tried after step 3, not kept (2026-11-26)
+
+- Windows' segment heap for the process (an application manifest): no
+  better, noisier. mimalloc for our own allocations was not tried (a new
+  dependency).
+- Early rounds of the heaps' records in parts (a quarter of each heap a
+  round): the submission waited longer (9.9 ms against 6.3).
+- Kept for looking: `VICTORY_TIMELINE_SUBMIT=1` samples the submitting thread
+  in a timeline. Its profile: about a quarter waiting (heaps' records, pools,
+  locks), 6 % asking the write watch, 8 % copying bytes, about 9 % in the
+  system heap's allocation and release.
+
 ## The measured settings in the launcher (2026-11-26)
 
 `play.ps1 -RX7900XT` now also sets `VICTORY_ASK_EARLY=2`,

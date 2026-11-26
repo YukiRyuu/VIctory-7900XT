@@ -5437,6 +5437,15 @@ impl Host {
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
+        // With a timeline, `VICTORY_TIMELINE_SUBMIT=1`: the thread that
+        // prepares submissions is sampled as the title's submitting ones are.
+        #[cfg(feature = "diagnostics")]
+        {
+            static SAMPLED: OnceLock<bool> = OnceLock::new();
+            if *SAMPLED.get_or_init(|| std::env::var_os("VICTORY_TIMELINE_SUBMIT").is_some_and(|v| v == "1")) {
+                crate::timeline::title_thread();
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
