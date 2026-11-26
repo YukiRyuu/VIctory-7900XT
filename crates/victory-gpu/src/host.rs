@@ -7523,7 +7523,14 @@ impl std::hash::Hasher for AddressHash {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        // Eight bytes a step (keys of whole descriptions, 56 bytes, are
+        // hashed thousands of times a frame by the threads that translate
+        // list calls).
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.write_u64(u64::from_le_bytes(word.try_into().unwrap_or_default()));
+        }
+        for &b in words.remainder() {
             self.write_usize(usize::from(b));
         }
     }

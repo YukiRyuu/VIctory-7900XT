@@ -315,6 +315,16 @@ fn start() {
                         }
                     }
                 };
+                // With a timeline, `VICTORY_TIMELINE_LISTS=1`: this thread is
+                // sampled as the title's submitting ones are (while places
+                // are free).
+                #[cfg(feature = "diagnostics")]
+                {
+                    static SAMPLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *SAMPLED.get_or_init(|| std::env::var_os("VICTORY_TIMELINE_LISTS").is_some_and(|v| v == "1")) {
+                        crate::timeline::title_thread();
+                    }
+                }
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }

@@ -1304,7 +1304,7 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
     if first == 0 || !held_only() {
         return placed_bytes(desc);
     }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
+    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
     thread_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }

@@ -46,6 +46,7 @@ if ($RX7900XT) {
     # (8 and 6 were for a 24-thread CPU): on 16 the title's own threads ran
     # short (free roam: 6-13 ms less preparing a frame, CHANGELOG.md).
     $settings.VICTORY_THIN_THREADS = '4'; $settings.VICTORY_UNDER_THREADS = '3'
+    $settings.VICTORY_LAND_THREADS = '3'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

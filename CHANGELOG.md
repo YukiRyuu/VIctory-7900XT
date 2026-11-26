@@ -5,6 +5,20 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## Landing on 3 threads; profile of the list threads (2026-11-26)
+
+`play.ps1 -RX7900XT` also sets `VICTORY_LAND_THREADS=3` (4 before): 39.0 ms
+preparing a frame at about 10,000 draws against 41.0 (release, free roam).
+3 list-call threads with 2 compare threads made preparing cheaper but the
+frame longer: the list calls became the wall (73,500 calls a frame, 76 ms of
+each of the 3 threads). View pools at 4 threads: worse.
+
+Sampled list threads (`VICTORY_TIMELINE_LISTS=1`, new, diagnostics): 7 %
+keeping slots' resources, 6 % binding, 6 % in thread-local tables, 5.7 %
+waiting for new card memory to be mapped (kept: without it the card faulted
+in avatarmanz's runs), 4 % the D3D12 runtime, about 5 % hashing. Descriptions
+are now hashed eight bytes a step with our own hasher; no change measured.
+
 ## Fewer worker threads for 16 hardware threads (2026-11-26)
 
 `play.ps1 -RX7900XT` now sets `VICTORY_THIN_THREADS=4` (list calls
