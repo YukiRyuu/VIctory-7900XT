@@ -51,7 +51,11 @@ mod tests {
         title_memory_unmapped(0x1000_0000, 0x1_0000);
         title_memory_unmapped(0x1000_0000, 0);
         assert_eq!(UNMAPPED_SEEN[1].load(Relaxed) - before, 0x1_0000);
-        assert!(GOT.load(Relaxed) >= 0x1_0000);
+        // Registered once for the whole test run: another test's function
+        // may have been there first.
+        if UNMAPPED.get().is_some_and(|g| std::ptr::fn_addr_eq(*g, f as fn(usize, usize))) {
+            assert!(GOT.load(Relaxed) >= 0x1_0000);
+        }
     }
 }
 
