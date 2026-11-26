@@ -271,6 +271,28 @@ impl Pool {
         }
     }
 
+    /// Does one job of the batch under way, if there is one left, on this
+    /// thread, as a helper would; whether it did.
+    fn help_one(&self) -> bool {
+        let mut state = self.state();
+        let Some((work, i)) = take(&mut state) else {
+            return false;
+        };
+        state.running += 1;
+        drop(state);
+        let working = crate::timeline::span("a landing's job");
+        // SAFETY: counted in `running`, so `each` has not returned.
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+        working.end();
+        let mut state = self.state();
+        state.running -= 1;
+        state.panicked |= ran.is_err();
+        if state.running == 0 {
+            self.idle.notify_all();
+        }
+        true
+    }
+
     /// Calls `f` with every number below `count`, on the pool's threads and
     /// this one, and returns when every call has.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
@@ -345,13 +367,23 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
 /// bytes, are others than those for the views picked by index: submissions
 /// wait for the first, lists for the second, and each kept the other waiting.
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
+    view_pool(records).each(count, f);
+}
+
+/// [`each_view`]'s pools.
+fn view_pool(records: bool) -> &'static Pool {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
-    POOLS[usize::from(records)]
-        .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
-            Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
-        })
-        .each(count, f);
+    POOLS[usize::from(records)].get_or_init(|| {
+        let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+        Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
+    })
+}
+
+/// One job of the batch [`each_view`]'s pool has under way, done on this
+/// thread, if one is left: for a thread that would otherwise wait for that
+/// batch's end. Whether it did one.
+pub(crate) fn help_view(records: bool) -> bool {
+    view_pool(records).help_one()
 }
 
 /// A piece to land: the copy's number, the title address, its bytes.

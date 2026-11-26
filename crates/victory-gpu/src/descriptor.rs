@@ -197,6 +197,15 @@ fn sync_early() -> Option<std::time::Duration> {
     })
 }
 
+/// Whether a submission that waits for its round does the round's jobs too
+/// ([`SyncedHeaps`]; `VICTORY_HEAP_SYNC_HELP=1`; off by default: in free roam
+/// the wait was 3.6 ms with it and 4.1 without, within the runs' noise).
+#[cfg(windows)]
+fn sync_help() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_HELP").is_some_and(|v| v == "1"))
+}
+
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
@@ -277,6 +286,24 @@ impl Drop for SyncedHeaps {
         let began = std::time::Instant::now();
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
         while rounds.1 < mine {
+            // With `VICTORY_HEAP_SYNC_HELP=1`: its jobs on the records'
+            // threads, done here too while there are any; 6-10 ms a frame of
+            // the submitting thread stood waiting here with nothing to do
+            // (runs t-prio1, r-cfox1).
+            if sync_help() {
+                drop(rounds);
+                if crate::land::help_view(true) {
+                    rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+                rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                if rounds.1 >= mine {
+                    break;
+                }
+                // Nothing to take this moment: a short sleep, then look again.
+                rounds = SYNC_ROUNDS.1.wait_timeout(rounds, std::time::Duration::from_micros(200)).unwrap_or_else(|e| e.into_inner()).0;
+                continue;
+            }
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
         }
         drop(rounds);
