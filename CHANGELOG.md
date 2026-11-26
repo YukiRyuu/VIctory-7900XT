@@ -41,6 +41,9 @@ compare like with like.
 - Windows' segment heap for the process (an application manifest): no
   better, noisier. mimalloc for our own allocations was not tried (a new
   dependency).
+- cool_fox's launcher settings `VICTORY_CARD_BUFFERS_MIN_KB=64` with
+  `VICTORY_LEVELS_ON_DEMAND=1`, release build, free roam: walking 98 ms of
+  preparing a frame and stalls to 1.8 fps (against 52 ms without).
 - Early rounds of the heaps' records in parts (a quarter of each heap a
   round): the submission waited longer (9.9 ms against 6.3).
 - Kept for looking: `VICTORY_TIMELINE_SUBMIT=1` samples the submitting thread
