@@ -754,6 +754,36 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The process's private bytes (diagnostics: around the making of lists).
+/// Resets of a host list after which its command allocator is replaced by a
+/// fresh one (`VICTORY_ALLOCATOR_RESETS`, 128; 0: never, as before). An
+/// allocator never gives back what it grew to: one that recorded a loading
+/// burst once kept that memory for the rest of the session, in the driver's
+/// write-combined system memory (about 20 GB of a 39 GB process on an
+/// RX 7900 XT, 2,195 host lists alive, most of it paged out). Replaced, it
+/// holds what its recent recordings needed.
+fn allocator_resets() -> u32 {
+    static EVERY: OnceLock<u32> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_ALLOCATOR_RESETS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128)
+    })
+}
+
+/// Allocators replaced so far, and (diagnostics) the private bytes their
+/// release gave back.
+static ALLOCATOR_SWAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn allocator_swapped(#[cfg(feature = "diagnostics")] freed: u64) {
+    let n = ALLOCATOR_SWAPS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    let total = ALLOCATOR_SWAPS[1].fetch_add(freed, Ordering::Relaxed) + freed;
+    if n.is_power_of_two() || n.is_multiple_of(4096) {
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(swaps = n, freed_mb = total >> 20, "command allocators replaced by fresh ones (VICTORY_ALLOCATOR_RESETS)");
+        #[cfg(not(feature = "diagnostics"))]
+        tracing::info!(swaps = n, "command allocators replaced by fresh ones (VICTORY_ALLOCATOR_RESETS)");
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -1136,7 +1166,11 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Swapped for a fresh one every [`allocator_resets`] resets: an
+    /// allocator keeps the most memory it ever held until it is released.
+    allocator: Mutex<ID3D12CommandAllocator>,
+    /// Resets since the allocator was made.
+    resets: AtomicU32,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -4035,7 +4069,8 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new(allocator),
+                resets: AtomicU32::new(0),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -6197,12 +6232,31 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let every = allocator_resets();
+        if every > 0 && self.resets.fetch_add(1, Ordering::Relaxed) + 1 >= every {
+            self.resets.store(0, Ordering::Relaxed);
+            // SAFETY: plain object creation.
+            let fresh = host().and_then(|h| unsafe { h.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.ok());
+            if let Some(fresh) = fresh {
+                #[cfg(feature = "diagnostics")]
+                let before = private_bytes();
+                // The old one goes: nothing of it runs (the list is not
+                // executing), and the list is reset onto the new one below.
+                drop(std::mem::replace(&mut *allocator, fresh));
+                allocator_swapped(
+                    #[cfg(feature = "diagnostics")]
+                    before.saturating_sub(private_bytes()),
+                );
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
-            self.allocator
+            allocator
                 .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+                .and_then(|()| self.list.Reset(&*allocator, None))
         };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
