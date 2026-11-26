@@ -35,6 +35,13 @@ if ($RX7900XT) {
     $settings.VICTORY_TEXTURE_STAGE_MS = '80'
     $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_INPLACE_MB = '3072'
     $settings.VICTORY_PIPELINE_BOOK = '1'
+    # Measured for 20 fps on the 7800X3D (CHANGELOG.md): the write watch asked
+    # early, the heaps' records every 1 ms, longer joined submissions, and the
+    # title's idle threads at below normal (16 threads are not enough for them
+    # to wait their turn).
+    $settings.VICTORY_ASK_EARLY = '2'; $settings.VICTORY_HEAP_SYNC_EARLY = '1'
+    $settings.VICTORY_JOIN_PARTS = '16'; $settings.VICTORY_JOIN_LISTS = '96'
+    $settings.VICTORY_TITLE_PRIORITIES = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
