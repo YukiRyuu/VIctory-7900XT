@@ -123,6 +123,10 @@ kept, and commits taken from elsewhere keep their authors.
   (and romainhedouin), **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**,
   **[myokex/victory-amd](https://github.com/myokex/victory-amd)** (with Spexivus,
   joroyt, tightfall and Joshua Odom), **Geckomacabre** and **cxy0072019-sketch**.
+- **codec_d's cool_fox** (published as
+  [JordanFromIT/cool_fox](https://github.com/JordanFromIT/cool_fox)): memory
+  budgets for 32 GB PCs, descriptor slots released on completion, and more,
+  merged as they are (CHANGELOG.md).
 - Built on, tested or studied on the way here, for code, settings, ideas and
   measurements:
   **[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)**
