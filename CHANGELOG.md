@@ -5,6 +5,24 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## Root views' reach asked once a second (2026-11-26)
+
+An ask without a length (a root view) is given the title memory committed
+around it (the intro's device removal), found by asking Windows region by
+region. It was asked at every such lookup, from the threads that translate
+list calls, while the title maps and unmaps pages: 680 queries in 8 frames
+of driving, 362 ms of those threads. The answer for a range is now used
+again for 1 s (`VICTORY_ROOT_REACH_MS`, 0: every time). Tag
+`goal-20fps-step2`.
+
+| | idle | driving |
+|---|---|---|
+| step 1 | 20.3 / 19.7 | 18.9 / 17.8 |
+| + this change | 22.5 / 22.0 | 19.6 / 16.0 |
+
+Tried, no better: the Series S profile (`--console series-s`): as many draws,
+slower.
+
 ## Window lookups share the lock (2026-11-26)
 
 With windows finer than their 4 MiB cell (`VICTORY_WINDOW_KB=1024`, in
