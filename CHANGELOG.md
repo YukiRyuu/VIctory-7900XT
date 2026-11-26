@@ -5,6 +5,29 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## codec_d's cool_fox merged (2026-11-26)
+
+The six commits of codec_d's fork (published as `JordanFromIT/cool_fox`, on
+the same avatarmanz base) taken as they are, but for their launcher (it runs
+their private prebuilt executable) and README: memory budgets for PCs with
+32 GB of RAM (texture staging bounded under memory pressure, pools that back
+off when Windows refuses them, uploads deferred under low commit), descriptor
+slots released when the card finishes, the bindless pass per heap,
+`VICTORY_INDIRECT_REST` off by default, NVIDIA Wave32 lowering, Series S fixes.
+Two tests of the indirect budget assumed `VICTORY_INDIRECT_REST` on: they ask
+for it now (or skip without it). After the merge, `victory shaders` again (the
+translator changed). Tag `goal-20fps-step4`.
+
+Free roam, the user's save outside the house (median / p10 / slowest):
+
+| | standing | walking | frame, average |
+|---|---|---|---|
+| step 3 | 17.6 / 10.9 / 1.8 | 15.0 / 9.8 / 7.8 | 105 / 76 ms |
+| + cool_fox | 17.3 / 16.8 / 14.6 | 17.2 / 16.7 / 16.4 | 59 / 59 ms |
+
+The free-roam view the walk faces sets the draws (6,000 to 13,000 a frame):
+compare like with like.
+
 ## Tried after step 3, not kept (2026-11-26)
 
 - Windows' segment heap for the process (an application manifest): no
