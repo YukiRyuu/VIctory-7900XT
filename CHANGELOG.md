@@ -5,6 +5,28 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## The Scarlett fork merged (2026-11-26)
+
+Op-lite/victory-scarlett, branch `scarlett-fox`: cool_fox (the same base) and
+one commit of picture fixes (16-bit values through integer views: frozen
+facial animation; a NaN guard on colour exports; 26 more compute programs
+translated: hair shadow masks, water volumetrics, particles, decals), memory
+and upload switches, frame logs and meters. Their scripts and Ghidra scripts
+are left out (notes and patches kept). `play.ps1 -RX7900XT` sets their three
+best switches: `VICTORY_POOL_DISCARD=1`, `VICTORY_FILL_TITLE=1`,
+`VICTORY_PARTIAL_DELTA=1`. Translate the shaders again after this merge. Tag
+`goal-20fps-step6`.
+
+Free roam, diagnostics build, walking: 15.0 fps, slowest tenth 14.1 (12.5 and
+7.7 without the three switches); about 2.5 GB less of the process in RAM.
+
+Their notes say what was seen here too: bushes and trees glow purple, and it
+came with the cool_fox base (not in this fork's builds before that merge).
+
+Measured for RAM and not kept: fewer idle host lists (`VICTORY_LIST_IDLE=256`:
+the 1,400 lists alive are in use, not idle), root-view windows reusing a
+covering window (no less memory, preparing slower).
+
 ## Landing on 3 threads; profile of the list threads (2026-11-26)
 
 `play.ps1 -RX7900XT` also sets `VICTORY_LAND_THREADS=3` (4 before): 39.0 ms

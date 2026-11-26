@@ -47,6 +47,11 @@ if ($RX7900XT) {
     # short (free roam: 6-13 ms less preparing a frame, CHANGELOG.md).
     $settings.VICTORY_THIN_THREADS = '4'; $settings.VICTORY_UNDER_THREADS = '3'
     $settings.VICTORY_LAND_THREADS = '3'
+    # From the Scarlett fork: pool pages given back when free RAM is low, the
+    # title's fills not waiting behind flights, and only the changed levels of
+    # a texture sent again (free roam: walking's slowest tenth 7.7 -> 14.1 fps).
+    $settings.VICTORY_POOL_DISCARD = '1'; $settings.VICTORY_FILL_TITLE = '1'
+    $settings.VICTORY_PARTIAL_DELTA = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

@@ -65,7 +65,8 @@ scripts\play.ps1 -RX7900XT -Exe <path of your copy's executable>
 
 For playing, build `--release` instead (about a fifth faster per frame than
 the diagnostics build here: CHANGELOG.md), translate the shaders with
-`targeteleaseictory.exe`, and add `-Build release` to the line above.
+`target
+eleaseictory.exe`, and add `-Build release` to the line above.
 `-RX7900XT` adds the settings measured on this PC to the fork's own (they are
 listed in the script). If PowerShell refuses to run scripts, start it as
 `powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -RX7900XT -Exe ...`
@@ -130,6 +131,8 @@ kept, and commits taken from elsewhere keep their authors.
   [JordanFromIT/cool_fox](https://github.com/JordanFromIT/cool_fox)): memory
   budgets for 32 GB PCs, descriptor slots released on completion, and more,
   merged as they are (CHANGELOG.md).
+- **[Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett)**:
+  picture fixes, memory and upload switches, merged (CHANGELOG.md).
 - Built on, tested or studied on the way here, for code, settings, ideas and
   measurements:
   **[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)**
