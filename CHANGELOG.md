@@ -5,6 +5,21 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## The purple in shadows fixed (2026-11-26)
+
+Blinds, curtains, bushes and trees glowed purple, most at night. Bisected
+on fixed saves (a copy of the user's, restored before each run) with the
+share of purple pixels in 12 shots per run: none before cool_fox, none at its
+first two commits, purple from `8cc31ab3` on; the same with cool_fox's
+translator taken out (an older translator over its GPU side), so not the
+shader changes. The cause: without the ray-tracing builder, cool_fox left out
+the `CS_RaytracingResolve` and `CS_ScreenProbes_ActivateRays` pipelines (to
+unclog a cold compiler queue). The screen probes' light goes through them;
+without them the probes kept what their memory held, and the stand-in light
+spread it into the shadows. They run again unless `VICTORY_RT_RESOLVE=0` /
+`VICTORY_ACTIVATE_RAYS=0`. Purple pixels: 15-69 per mille in a shot before,
+0-1 after. Tag `goal-20fps-step7`.
+
 ## The Scarlett fork merged (2026-11-26)
 
 Op-lite/victory-scarlett, branch `scarlett-fox`: cool_fox (the same base) and
@@ -21,7 +36,7 @@ Free roam, diagnostics build, walking: 15.0 fps, slowest tenth 14.1 (12.5 and
 7.7 without the three switches); about 2.5 GB less of the process in RAM.
 
 Their notes say what was seen here too: bushes and trees glow purple, and it
-came with the cool_fox base (not in this fork's builds before that merge).
+came with the cool_fox base (fixed since: the entry above).
 
 Measured for RAM and not kept: fewer idle host lists (`VICTORY_LIST_IDLE=256`:
 the 1,400 lists alive are in use, not idle), root-view windows reusing a

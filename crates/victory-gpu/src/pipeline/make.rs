@@ -68,9 +68,14 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         if builder {
             return false;
         }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits and
+        // clog a cold compiler queue (cool_fox's reason to leave them out).
+        // But the screen probes' light goes through them: left out, the
+        // probes kept what their memory held and the stand-in light spread it
+        // into the shadows, purple (blinds, curtains, foliage, at night most;
+        // bisected to cool_fox 8cc31ab3, gone with them run, run p-rtfix2).
+        // Left out only with `VICTORY_RT_RESOLVE=0`.
+        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0")
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
@@ -78,10 +83,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+        // As the resolve above: the probes need it. Left out only with
+        // `VICTORY_ACTIVATE_RAYS=0`, with or without the builder.
+        let _ = builder;
+        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
