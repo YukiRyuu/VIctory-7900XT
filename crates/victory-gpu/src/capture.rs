@@ -16,6 +16,47 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+/// Frames after a press of the capture key (`VICTORY_CAPTURE_KEY`: F11
+/// unless it names another function key, `F1` to `F24`; with a capture
+/// folder): the next [`KEYED_FRAMES`] frames count as listed, so they are
+/// saved with their draws (and with `VICTORY_DUMP_TARGETS=1` their render
+/// targets). For what comes and goes from one frame to the next, such as
+/// flickering foliage, whose frame numbers no list can name ahead.
+const KEYED_FRAMES: u64 = 8;
+
+fn keyed(n: u64) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static UNTIL: AtomicU64 = AtomicU64::new(0);
+    static FROM: AtomicU64 = AtomicU64::new(0);
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    static LOOKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static KEY: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    if folder().is_none() {
+        return false;
+    }
+    let key = *KEY.get_or_init(|| {
+        let f = std::env::var("VICTORY_CAPTURE_KEY").ok().and_then(|v| v.trim().trim_start_matches(['F', 'f']).parse::<i32>().ok());
+        // VK_F1 is 0x70.
+        0x70 + f.filter(|k| (1..=24).contains(k)).unwrap_or(11) - 1
+    });
+    // Looked at once a frame number: several threads ask about the same frame.
+    if LOOKED.swap(n, Relaxed) != n {
+        #[cfg(windows)]
+        {
+            // SAFETY: a plain query of the key's state.
+            let down = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key) } < 0;
+            if down && !DOWN.swap(true, Relaxed) {
+                FROM.store(n + 1, Relaxed);
+                UNTIL.store(n + 1 + KEYED_FRAMES, Relaxed);
+                tracing::info!(from = n + 1, frames = KEYED_FRAMES, "capture key: the next frames are saved");
+            } else if !down {
+                DOWN.store(false, Relaxed);
+            }
+        }
+    }
+    n >= FROM.load(Relaxed) && n < UNTIL.load(Relaxed)
+}
+
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
@@ -28,6 +69,7 @@ pub(crate) fn listed(n: u64) -> bool {
                 .collect()
         })
         .contains(&n);
+    let named = named || keyed(n);
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
