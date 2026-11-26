@@ -1,40 +1,45 @@
-# VIctory on an RX 7900 XTX
+# VIctory on an RX 7900 XT
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+itself a fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility
+layer that runs an Xbox Series title natively on Windows from files the user
+supplies. This one is tuned and measured on an **RX 7900 XT with 32 GB of RAM**,
+half the memory the forks it comes from were tested with, by **ryuki**.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+## The PC it was tested on
 
 | | |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| GPU | AMD Radeon RX 7900 XT, 20 GB (driver 32.0.32015.7029), Resizable BAR on |
+| CPU | AMD Ryzen 7 7800X3D (8 cores, 16 threads) |
+| RAM | 32 GB DDR5 (about 31 GB usable), running at 4800 MT/s |
+| Board | Gigabyte B650 AORUS ELITE AX |
+| OS | Windows 11 Pro, build 26300 |
+| Display | 2560x1440, the title's Series X profile |
+| Page file | on D:, 32 GB initial, 88 GB most |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+## Where it stands (2026-11-26)
 
-What is known to be wrong:
+| | |
+|---|---|
+| Menus, videos, loading screens | 30 fps (the title's cap) |
+| In the world (prologue, first mission) | about 18-19 fps median, peaks in the mid 20s |
+| Longest session | over 30 minutes; stable since the page file was raised |
+| Memory | 35-40 GB committed during play, more in bursts |
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
+Where it started on this PC: 12-13 fps, and out-of-memory crashes at cutscene
+skips.
+
+Still wrong:
+
+- Trees and plants flicker outdoors.
 - Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- The first run with a new driver or build stutters while pipelines are made
+  (`victory warm` makes them ahead).
 
 ## How to run it
 
@@ -42,76 +47,100 @@ You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
+**With 32 GB of RAM, raise the page file first** (System > About > Advanced
+system settings > Performance > Advanced > Virtual memory): the process commits
+more than the RAM, and below RAM + page file the title stops with "no host list
+for a state prelude" (0x8007000E). Windows caps one page file at three times the
+RAM.
+
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/YukiRyuu/VIctory-7900XT
+cd VIctory-7900XT
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+$env:VICTORY_HOST_WAVE = '64'; $env:VICTORY_VIEW_LIMIT = '2097151'
+target\diag\victory.exe shaders <the shader archives>   # every shader translated ahead, minutes
+scripts\play-7900xt.cmd <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+After a first run, `target\diag\victory.exe warm --used` makes the pipelines it
+drew with ahead of the next one. `scripts\play-7900xt.cmd` is a `.cmd`, so it
+runs where PowerShell scripts are blocked; in a diagnostics build F11 saves the
+next 8 frames to `%LOCALAPPDATA%\victory\captures`.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+## What was found
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+All runs, figures and reasons: [docs/rx7900xt.md](docs/rx7900xt.md). In short:
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+- **Commit, not RAM, is the limit.** The process commits 35-40 GB in play and
+  jumped 7 GB in 40 s at a cutscene skip. A bigger page file ended the crashes.
+- **Less committed memory** in windows of title memory outside buffers:
+  `VICTORY_WINDOW_KB=1024` with `VICTORY_ROOT_WINDOW_MB=12`, 6.9 GB down to
+  1.3 GB at the same point, and faster (15.9 to 18.2 fps).
+- **A device removal in the intro fixed**: a root view has no size and was
+  given 4 MiB of title memory; a shader read past it into freed memory (DRED).
+  Its window now reaches the title memory committed around it.
+- **Shader-write compares on the card for buffers of 1 MiB and more**
+  (`VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1536`), smaller
+  texture steps at scene cuts (`VICTORY_TEXTURE_STAGE_MS=80`), and windows in
+  private memory used in place (`VICTORY_INPLACE=1`): preparing a frame 45 to
+  37 ms.
+- **Most of a frame is the cost of two memories.** In a 53 ms frame: the write
+  watch 10.8 ms, refreshes 11.5, copy-back 16.1, waits on the trackers' locks
+  26 ms across threads, the card about 67 % busy. The direction that could
+  close it: the title's page-pool sections committed, each page placed in the
+  order of its addresses, buffers over them used in place (the driver opens
+  committed memory as a heap; it refuses reserved memory, and tile mappings
+  into such a heap remove the device).
+- **Tried and not kept:**
+  - The title's GPU memory on the card through Resizable BAR (ForwardVI's
+    `VICTORY_CARD_MEMORY`): 19.4 down to 12.7-15.5 fps, and characters' faces
+    black. The processor reads that memory at about 30 MB/s.
+  - Replacing command allocators every 128 resets: 2 MB given back in 12,288
+    swaps. The ~21 GB of write-combined memory in the process is not theirs.
+  - Turning the indirect paths off for the tree flicker: still flickers, half
+    the frame rate. The suspect left: copies without a per-submission snapshot
+    while two frames are prepared ahead (`VICTORY_RELAY`); not tested yet.
+  - Mip levels on demand: over the card's memory budget.
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+This is a tree of other people's work with a little on top. The history is
+kept, and commits taken from elsewhere keep their authors.
 
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the fork this one is built on, its speed work and its findings
+  ([docs/README-avatarmanz.md](docs/README-avatarmanz.md),
+  [docs/findings.md](docs/findings.md)), with ZETTROX, whom its README names.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- Carried by avatarmanz's fork: **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**,
+  **[DexNom/VIctory](https://github.com/DexNom/VIctory)**,
+  **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
+  (and romainhedouin), **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**,
+  **[myokex/victory-amd](https://github.com/myokex/victory-amd)** (with Spexivus,
+  joroyt, tightfall and Joshua Odom), **Geckomacabre** and **cxy0072019-sketch**.
+- Built on, tested or studied on the way here, for code, settings, ideas and
+  measurements:
+  **[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)**
+  (where the root-view fix was first made),
+  **[PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab)**,
+  **[CDR-0000/ForwardVI](https://github.com/CDR-0000/ForwardVI)** (card memory and
+  the driver shader-cache trim, tried here),
+  **[shadowdog00/vi-pc-combo](https://github.com/shadowdog00/vi-pc-combo)**,
+  **[kzkvf88zhs-boop/ANYDEV](https://github.com/kzkvf88zhs-boop/ANYDEV)**,
+  **[clankenjoyer/victory-fps](https://github.com/clankenjoyer/victory-fps)**,
+  **[SnickeredMG/specific-assets-vctry](https://github.com/SnickeredMG/specific-assets-vctry)**,
+  and the dumps shared in
+  **[skornuta/victory-fork](https://github.com/skornuta/victory-fork)**.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read by
+  avatarmanz's fork for how the same title behaves under another layer; no code
+  of it is here.
+- This fork's changes were made by ryuki with
+  [Claude Code](https://claude.com/claude-code).
 
 ## License
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
-
-ZETTROX
