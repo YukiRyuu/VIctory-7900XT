@@ -60,13 +60,15 @@ copy victory.example.toml victory.toml      # then set your paths, outside this 
 cargo build --locked --profile diag -p victory --features diagnostics
 $env:VICTORY_HOST_WAVE = '64'; $env:VICTORY_VIEW_LIMIT = '2097151'
 target\diag\victory.exe shaders <the shader archives>   # every shader translated ahead, minutes
-scripts\play-7900xt.cmd <path of your copy's executable>
+scripts\play.ps1 -RX7900XT -Exe <path of your copy's executable>
 ```
 
-After a first run, `target\diag\victory.exe warm --used` makes the pipelines it
-drew with ahead of the next one. `scripts\play-7900xt.cmd` is a `.cmd`, so it
-runs where PowerShell scripts are blocked; in a diagnostics build F11 saves the
-next 8 frames to `%LOCALAPPDATA%\victory\captures`.
+`-RX7900XT` adds the settings measured on this PC to the fork's own (they are
+listed in the script). If PowerShell refuses to run scripts, start it as
+`powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -RX7900XT -Exe ...`
+(for that one window only). After a first run, `target\diag\victory.exe warm --used`
+makes the pipelines it drew with ahead of the next one. In a diagnostics build,
+`-More @{VICTORY_CAPTURE='<a folder>'}` lets F11 save the next 8 frames there.
 
 ## What was found
 

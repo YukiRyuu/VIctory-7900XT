@@ -3,12 +3,14 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
+# -RX7900XT     also the settings measured best on an RX 7900 XT with 32 GB of RAM (docs/rx7900xt.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$RX7900XT,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -24,6 +26,16 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RX7900XT) {
+    # Shader-write compares on the card for buffers of 1 MiB and more; less committed
+    # memory in windows of title memory (about 5 GB less); smaller texture steps at scene
+    # cuts; windows in private memory used in place; pipelines written down for "victory warm".
+    $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
+    $settings.VICTORY_ROOT_WINDOW_MB = '12'; $settings.VICTORY_WINDOW_KB = '1024'
+    $settings.VICTORY_TEXTURE_STAGE_MS = '80'
+    $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_INPLACE_MB = '3072'
+    $settings.VICTORY_PIPELINE_BOOK = '1'
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
