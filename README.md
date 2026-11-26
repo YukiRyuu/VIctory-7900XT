@@ -63,6 +63,9 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 scripts\play.ps1 -RX7900XT -Exe <path of your copy's executable>
 ```
 
+For playing, build `--release` instead (about a fifth faster per frame than
+the diagnostics build here: CHANGELOG.md), translate the shaders with
+`targeteleaseictory.exe`, and add `-Build release` to the line above.
 `-RX7900XT` adds the settings measured on this PC to the fork's own (they are
 listed in the script). If PowerShell refuses to run scripts, start it as
 `powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -RX7900XT -Exe ...`

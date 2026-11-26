@@ -5,6 +5,14 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## Play the release build (2026-11-26)
+
+Free roam at the user's save, release against diagnostics build, run after
+run (Parsec capturing the screen in both): walking 6.5 against 7.9 ms a
+frame per 1,000 draws, standing 17.0 fps (slowest tenth 16.0) at 6,100 draws.
+To play: `cargo build --release --locked -p victory`, `victory shaders` with
+the release executable, then `scripts\play.ps1 -RX7900XT -Build release`.
+
 ## codec_d's cool_fox merged (2026-11-26)
 
 The six commits of codec_d's fork (published as `JordanFromIT/cool_fox`, on
