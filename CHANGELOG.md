@@ -5,6 +5,25 @@ Each entry names the commit and, where there is one, a tag to go back to:
 (after saving anything newer elsewhere). Frame rates are medians of the log's
 frame lines in the world, diagnostics build, on the PC in the README.
 
+## Fewer worker threads for 16 hardware threads (2026-11-26)
+
+`play.ps1 -RX7900XT` now sets `VICTORY_THIN_THREADS=4` (list calls
+translated, 8 before) and `VICTORY_UNDER_THREADS=3` (title bytes under
+flights' writes compared, 6 before). The defaults were measured on a 24-thread
+i9-12900K; on the 7800X3D's 16 they took the processors from the title's own
+threads. Release build, free roam at the user's save, preparing a frame at
+like draws (interleaved runs, Parsec capturing in all):
+
+| draws a frame | 4 and 3 threads | 8 and 6 |
+|---|---|---|
+| 5,600-5,900 | 41.1 ms | 43.3-47.8 |
+| 7,200 | 42.1 | 48.6 |
+| 8,000-8,500 | 43.3-44.3 | 49.9 |
+| 10,000-10,400 | 40.1-41.0 | 51.9-55.7 |
+
+Walking in the lighter views: 19.7 fps (slowest tenth 17.8). Tag
+`goal-20fps-step5`.
+
 ## Play the release build (2026-11-26)
 
 Free roam at the user's save, release against diagnostics build, run after

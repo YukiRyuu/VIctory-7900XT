@@ -42,6 +42,10 @@ if ($RX7900XT) {
     $settings.VICTORY_ASK_EARLY = '2'; $settings.VICTORY_HEAP_SYNC_EARLY = '1'
     $settings.VICTORY_JOIN_PARTS = '16'; $settings.VICTORY_JOIN_LISTS = '96'
     $settings.VICTORY_TITLE_PRIORITIES = '1'
+    # Fewer of our threads translating list calls and comparing title bytes
+    # (8 and 6 were for a 24-thread CPU): on 16 the title's own threads ran
+    # short (free roam: 6-13 ms less preparing a frame, CHANGELOG.md).
+    $settings.VICTORY_THIN_THREADS = '4'; $settings.VICTORY_UNDER_THREADS = '3'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
